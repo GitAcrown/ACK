@@ -8,7 +8,7 @@ from discord.ext import commands, tasks
 
 from utils import dataio, pretty
 
-logger = logging.getLogger("BOT.MsgBoard")
+logger = logging.getLogger("Slobot.MsgBoard")
 
 LOGS_EXPIRATION = 60 * 60 * 24 * 7  # 7 jours
 CACHE_SAVE_INTERVAL_MINUTES = 30
@@ -25,6 +25,13 @@ UNICODE_EMOJI_RE = re.compile(
     "\U0001f000-\U0001f0ff\U0001f100-\U0001f1ff\U0001f300-\U0001f5ff\U0001f600-\U0001f64f"
     "\U0001f680-\U0001f6ff\U0001f900-\U0001f9ff\U0001fa00-\U0001faff"
     "]+$"
+)
+
+# Images et vidéos affichables dans une MediaGallery Components V2.
+GALLERY_MEDIA_TYPES = ("image/", "video/")
+GALLERY_MEDIA_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".webm", ".mov")
+JUMP_URL_RE = re.compile(
+    r"https?://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)"
 )
 
 
@@ -45,6 +52,105 @@ def _is_valid_vote_emoji(guild: discord.Guild, raw: str) -> tuple[bool, str, str
     if not UNICODE_EMOJI_RE.match(str(partial)):
         return False, raw, "L'emoji doit être un emoji Unicode standard ou un emoji personnalisé de ce serveur."
     return True, str(partial), None
+
+
+def _is_gallery_media(attachment: discord.Attachment) -> bool:
+    """True si la pièce jointe peut être affichée dans une MediaGallery (image ou vidéo)."""
+    content_type = (attachment.content_type or "").lower()
+    if content_type.startswith(GALLERY_MEDIA_TYPES):
+        return True
+    return attachment.filename.lower().endswith(GALLERY_MEDIA_EXTENSIONS)
+
+
+def _normalize_media_url(url: str) -> str:
+    """Compare les URLs CDN en ignorant les query params (signatures / tailles)."""
+    return url.split("?", 1)[0]
+
+
+def _resolve_media_url(media: discord.components.UnfurledMediaItem, attachments_by_name: dict[str, discord.Attachment]) -> str | None:
+    """Résout une URL de média (y compris `attachment://filename`)."""
+    url = media.url
+    if not url:
+        return None
+    if url.startswith("attachment://"):
+        attachment = attachments_by_name.get(url[len("attachment://") :])
+        return attachment.url if attachment else None
+    return url
+
+
+def _iter_components(components: list) -> list:
+    """Parcourt récursivement les composants V2 (Container / Section → enfants et accessoires)."""
+    found = []
+    for component in components:
+        found.append(component)
+        children = getattr(component, "children", None)
+        if children:
+            found.extend(_iter_components(children))
+        accessory = getattr(component, "accessory", None)
+        if accessory is not None:
+            found.extend(_iter_components([accessory]))
+    return found
+
+
+def _collect_gallery_items(message: discord.Message) -> list[discord.MediaGalleryItem]:
+    """Récupère images/vidéos à afficher : pièces jointes, MediaGallery V2, embeds, etc.
+
+    Les miniatures d'avatar déjà utilisées dans l'en-tête sont exclues pour éviter les doublons.
+    """
+    items: list[discord.MediaGalleryItem] = []
+    seen: set[str] = set()
+    attachments_by_name = {a.filename: a for a in message.attachments}
+    skip_urls = {_normalize_media_url(message.author.display_avatar.url)}
+    if message.reference and isinstance(message.reference.resolved, discord.Message):
+        skip_urls.add(_normalize_media_url(message.reference.resolved.author.display_avatar.url))
+
+    def add(url: str | None, description: str | None = None) -> None:
+        if not url:
+            return
+        key = _normalize_media_url(url)
+        if key in seen or key in skip_urls:
+            return
+        seen.add(key)
+        items.append(discord.MediaGalleryItem(url, description=description))
+
+    for attachment in message.attachments:
+        if _is_gallery_media(attachment):
+            add(attachment.url, attachment.filename)
+
+    for component in _iter_components(message.components):
+        if isinstance(component, discord.components.MediaGalleryComponent):
+            for item in component.items:
+                add(_resolve_media_url(item.media, attachments_by_name), item.description)
+        elif isinstance(component, discord.components.ThumbnailComponent):
+            add(_resolve_media_url(component.media, attachments_by_name), component.description)
+        elif isinstance(component, discord.components.FileComponent):
+            content_type = (component.media.content_type or "").lower()
+            name = (component.name or "").lower()
+            if content_type.startswith(GALLERY_MEDIA_TYPES) or name.endswith(GALLERY_MEDIA_EXTENSIONS):
+                add(_resolve_media_url(component.media, attachments_by_name), component.name)
+
+    for embed in message.embeds:
+        if embed.image and embed.image.url:
+            add(embed.image.url)
+        if embed.video and embed.video.url:
+            add(embed.video.url)
+
+    return items[:10]
+
+
+def _extract_origin_jump_url(board_message: discord.Message) -> str | None:
+    """Récupère l'URL du bouton « Message d'origine » d'un post compilé."""
+    for component in _iter_components(board_message.components):
+        if isinstance(component, discord.components.Button) and component.url and JUMP_URL_RE.match(component.url):
+            return component.url
+    return None
+
+
+def _parse_jump_url(url: str) -> tuple[int, int, int] | None:
+    match = JUMP_URL_RE.match(url)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
 def _build_board_entry_view(message: discord.Message) -> discord.ui.LayoutView:
@@ -80,15 +186,11 @@ def _build_board_entry_view(message: discord.Message) -> discord.ui.LayoutView:
         )
     )
 
-    image_attachments = [a for a in message.attachments if (a.content_type or "").startswith("image/")]
-    other_attachments = [a for a in message.attachments if a not in image_attachments]
+    gallery_items = _collect_gallery_items(message)
+    other_attachments = [a for a in message.attachments if not _is_gallery_media(a)]
 
-    if image_attachments:
-        container.add_item(
-            discord.ui.MediaGallery(
-                *[discord.MediaGalleryItem(a.url, description=a.filename) for a in image_attachments[:10]]
-            )
-        )
+    if gallery_items:
+        container.add_item(discord.ui.MediaGallery(*gallery_items))
     if other_attachments:
         container.add_item(
             discord.ui.TextDisplay("\n".join(f"[{a.filename}]({a.url})" for a in other_attachments))
@@ -97,7 +199,9 @@ def _build_board_entry_view(message: discord.Message) -> discord.ui.LayoutView:
         container.add_item(
             discord.ui.TextDisplay("\n".join(f"[Sticker · {s.name}]({s.url})" for s in message.stickers))
         )
-    if message.embeds:
+    if message.embeds and not any(
+        (e.image and e.image.url) or (e.video and e.video.url) for e in message.embeds
+    ):
         container.add_item(
             discord.ui.TextDisplay(f"-# Ce message contient {len(message.embeds)} embed(s) non reproduit(s) ici.")
         )
@@ -509,6 +613,66 @@ class MsgBoard(commands.Cog):
             logger.error(f"Erreur inattendue lors de la compilation du message {message.id} : {e}", exc_info=True)
             return None
 
+    async def repair_board_posts(
+        self, guild: discord.Guild, board_channel: discord.TextChannel
+    ) -> tuple[int, int, int]:
+        """Réédite les posts du salon de compilation avec le rendu actuel (images + vidéos).
+
+        :return: (mis_à_jour, ignorés, échecs)
+        """
+        me = guild.me
+        updated = skipped = failed = 0
+
+        async for board_msg in board_channel.history(limit=None):
+            if board_msg.author.id != me.id:
+                continue
+
+            jump_url = _extract_origin_jump_url(board_msg)
+            if not jump_url:
+                skipped += 1
+                continue
+
+            parsed = _parse_jump_url(jump_url)
+            if not parsed:
+                skipped += 1
+                continue
+            _guild_id, channel_id, message_id = parsed
+
+            channel = guild.get_channel(channel_id)
+            if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+                try:
+                    channel = await guild.fetch_channel(channel_id)
+                except discord.HTTPException:
+                    failed += 1
+                    continue
+            if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+                failed += 1
+                continue
+
+            try:
+                origin = await channel.fetch_message(message_id)
+            except discord.NotFound:
+                skipped += 1
+                continue
+            except discord.HTTPException:
+                failed += 1
+                continue
+
+            # On ne réédite que les posts qui ont réellement des médias à intégrer
+            # (pièces jointes, MediaGallery V2 du message d'origine, embeds, etc.).
+            if not _collect_gallery_items(origin):
+                skipped += 1
+                continue
+
+            try:
+                await board_msg.edit(view=_build_board_entry_view(origin))
+                updated += 1
+            except discord.HTTPException as e:
+                logger.error(f"Échec de réparation du post MsgBoard {board_msg.id} : {e}")
+                failed += 1
+
+        return updated, skipped, failed
+
     # ------------------------------------------------------------------
     # EVENT
     # ------------------------------------------------------------------
@@ -600,6 +764,35 @@ class MsgBoard(commands.Cog):
             tracked_count=self._tracked_count(guild),
         )
         await view.start(interaction)
+
+    @app_commands.command(name="msgboardrepair")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_messages=True)
+    async def repair_msgboard(self, interaction: discord.Interaction) -> None:
+        """Réédite les posts du MsgBoard pour intégrer images et vidéos dans la MediaGallery."""
+        guild = interaction.guild
+        if not isinstance(guild, discord.Guild):
+            return await interaction.response.send_message(
+                "**Erreur ·** Cette commande ne peut être utilisée que sur un serveur.", ephemeral=True
+            )
+
+        board_channel = await self.get_board_channel(guild)
+        if not board_channel:
+            return await interaction.response.send_message(
+                "**Erreur ·** Aucun salon de compilation n'est configuré.", ephemeral=True
+            )
+        if not board_channel.permissions_for(guild.me).read_message_history:
+            return await interaction.response.send_message(
+                "**Erreur ·** Je n'ai pas la permission de lire l'historique du salon de compilation.", ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+        updated, skipped, failed = await self.repair_board_posts(guild, board_channel)
+        await interaction.followup.send(
+            f"**Réparation terminée ·** {updated} post(s) mis à jour, "
+            f"{skipped} ignoré(s), {failed} échec(s).",
+            ephemeral=True,
+        )
 
     # ------------------------------------------------------------------
     # Menu contextuel — ajout manuel sans passer par le seuil de votes
