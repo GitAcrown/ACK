@@ -19,7 +19,7 @@ from discord.ext import commands
 
 COMMON_RESOURCES_PATH = Path("common/resources")
 
-logger = logging.getLogger("BOT.DataIO")
+logger = logging.getLogger("Slobot.DataIO")
 
 __COGDATA_INSTANCES: dict[str, "CogData"] = {}
 

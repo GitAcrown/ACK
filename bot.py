@@ -41,7 +41,7 @@ logging.basicConfig(
     ],
 )
 
-logger = logging.getLogger("BOT.Main")
+logger = logging.getLogger("Slobot.Main")
 
 # Réduire le bruit des libs tierces
 logging.getLogger("discord").setLevel(logging.WARNING)

@@ -16,7 +16,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from utils import dataio, fuzzy
 
-logger = logging.getLogger("BOT.Colors")
+logger = logging.getLogger("Slobot.Colors")
 
 HEX_COLOR_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")
 REORGANIZE_EVERY = 10

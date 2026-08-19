@@ -1,4 +1,4 @@
-# M8
+# Slobot
 
 Bot Discord modulaire (discord.py) organisé en cogs indépendants, chacun avec sa propre persistance SQLite et ses panneaux de configuration en Components V2 (`LayoutView`).
 
@@ -9,9 +9,9 @@ Bot Discord modulaire (discord.py) organisé en cogs indépendants, chacun avec 
 - **MsgBoard** — compile les meilleurs messages d'un serveur dans un salon dédié dès qu'un seuil de votes par réaction (emoji configurable) est atteint ; ajout manuel possible via menu contextuel.
 - **Colors** — attribution de rôles de couleur personnalisés (`/color set`, `/color remove`) par code hexadécimal, nom (autocomplétion), ou couleur dominante d'un avatar ; génération de palettes d'images (`/palette`).
 - **Quotes** — génère une image de citation (mono ou multi-auteurs) à partir d'un ou plusieurs messages sélectionnés via menu contextuel ; citations aléatoires Inspirobot (`/quote`).
-- **Birthdays** — chaque membre renseigne sa date de naissance dans un panneau personnel (`/birthday`) ; annonce automatique quotidienne des anniversaires du jour dans un salon configurable, et consultation des prochains anniversaires triés (`/birthdays`).
+- **Birthdays** — chaque membre renseigne sa date de naissance (`/birthday set`) ; annonce automatique quotidienne des anniversaires du jour dans un salon configurable, et consultation des prochains anniversaires triés (`/birthdays`).
 
-Chaque cog expose son propre panneau de configuration réservé à la modération (`/msgboardconfig`, `/colorconfig`, `/birthdayconfig`).
+Chaque cog expose son propre panneau de configuration réservé à la modération (`/msgbconfig`, `/colorconfig`, `/birthdayconfig`).
 
 ## Administration
 
