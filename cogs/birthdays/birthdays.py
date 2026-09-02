@@ -8,7 +8,7 @@ from discord.ext import commands, tasks
 
 from utils import dataio
 
-logger = logging.getLogger("Slobot.Birthdays")
+logger = logging.getLogger("ACK.Birthdays")
 
 MONTHS_FR = (
     "janvier", "février", "mars", "avril", "mai", "juin",

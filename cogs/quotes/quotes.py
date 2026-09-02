@@ -17,7 +17,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 from utils import dataio, pretty
 
-logger = logging.getLogger("Slobot.Quotes")
+logger = logging.getLogger("ACK.Quotes")
 
 QUOTE_SIZE = (512, 512)
 MULTI_WIDTH = 1000

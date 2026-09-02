@@ -1,4 +1,4 @@
-# Slobot
+# ACK
 
 Bot Discord modulaire (discord.py) organisé en cogs indépendants, chacun avec sa propre persistance SQLite et ses panneaux de configuration en Components V2 (`LayoutView`).
 
