@@ -8,7 +8,7 @@ from discord.ext import commands, tasks
 
 from utils import dataio, pretty
 
-logger = logging.getLogger("ACK.MsgBoard")
+logger = logging.getLogger("WANDER.MsgBoard")
 
 LOGS_EXPIRATION = 60 * 60 * 24 * 7  # 7 jours
 CACHE_SAVE_INTERVAL_MINUTES = 30

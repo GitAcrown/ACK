@@ -16,7 +16,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from utils import dataio, fuzzy
 
-logger = logging.getLogger("ACK.Colors")
+logger = logging.getLogger("WANDER.Colors")
 
 HEX_COLOR_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")
 REORGANIZE_EVERY = 10

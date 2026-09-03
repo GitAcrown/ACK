@@ -1,4 +1,4 @@
-# ACK
+# WANDER
 
 Bot Discord modulaire (discord.py) organisé en cogs indépendants, chacun avec sa propre persistance SQLite et ses panneaux de configuration en Components V2 (`LayoutView`).
 
@@ -10,9 +10,8 @@ Bot Discord modulaire (discord.py) organisé en cogs indépendants, chacun avec 
 - **Colors** — attribution de rôles de couleur personnalisés (`/color set`, `/color remove`) par code hexadécimal, nom (autocomplétion), ou couleur dominante d'un avatar ; génération de palettes d'images (`/palette`).
 - **Quotes** — génère une image de citation (mono ou multi-auteurs) à partir d'un ou plusieurs messages sélectionnés via menu contextuel ; citations aléatoires Inspirobot (`/quote`).
 - **Birthdays** — chaque membre renseigne sa date de naissance (`/bday set`) ; annonce automatique quotidienne des anniversaires du jour dans un salon configurable, et consultation des prochains anniversaires triés (`/bdays`).
-- **Reviews** — carnet de critiques type Senscritique / Letterboxd : noter (0 à 5, demies étoiles) films et séries (TMDB), jeux (Steam), albums et morceaux (Spotify) ou livres (Open Library), avec commentaire optionnel (`/critique note`, `/critique fiche`, `/critique journal`, `/critique search`, `/critique top`). Affinités de goût (`/critique affinite`), profil + XP (`/critique profil`), fiches LayoutView, top, annonces des nouvelles notes. Les récompenses de profil se craftent dans `cogs/reviews/progress.py`.
 
-Chaque cog expose son propre panneau de configuration réservé à la modération (`/msgbconfig`, `/colorconfig`, `/bdayconfig`, `/critiqueconfig`).
+Chaque cog expose son propre panneau de configuration réservé à la modération (`/msgbconfig`, `/colorconfig`, `/bdayconfig`).
 
 ## Administration
 
@@ -23,7 +22,7 @@ Commandes propriétaire (préfixe `&`) : `ping`, `restart`, `update` (git pull +
 - [discord.py](https://discordpy.readthedocs.io/) — interface Discord (Components V2 / `LayoutView`)
 - aiosqlite — persistance locale, une base par cog/serveur/utilisateur
 - Pillow, numpy, opencv-python-headless, colorgram.py — génération et analyse d'images
-- python-dotenv — configuration via `.env` (`TOKEN`, `APP_ID`, plus `TMDB_API_KEY`, `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` pour les critiques)
+- python-dotenv — configuration via `.env` (`TOKEN`, `APP_ID`)
 
 ## Licence
 
