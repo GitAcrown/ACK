@@ -35,7 +35,7 @@ VALID_RATINGS = tuple(i / 2 for i in range(11))
 DEFAULT_COMMENT_MAX = 280
 MIN_COMMENT_MAX = 50
 MAX_COMMENT_MAX = 500
-JOURNAL_PAGE = 5
+JOURNAL_PAGE = 4
 REVIEWS_PAGE = 5
 CATALOG_PAGE = 8
 
@@ -59,6 +59,12 @@ TYPE_CHOICES = [
 ]
 
 PERIOD_SECONDS = {"semaine": 7 * 86400, "mois": 30 * 86400}
+
+FAVORITE_LABELS = {
+    1: "Fétiche",
+    2: "Coup de cœur",
+    3: "Pépite",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +333,18 @@ def _link_label(hit: MediaHit) -> str:
     }.get(hit.source, "Fiche")
 
 
+async def open_public_fiche(
+    cog: "Reviews",
+    guild: discord.Guild,
+    interaction: discord.Interaction,
+    hit: MediaHit,
+) -> None:
+    view = MediaSessionView(cog, guild, [hit], author_id=interaction.user.id, ephemeral=False)
+    await view.prepare()
+    view._interaction = interaction
+    view._message = await interaction.followup.send(view=view, allowed_mentions=NO_PINGS)
+
+
 # ---------------------------------------------------------------------------
 # Annonce publique (présentation seule)
 # ---------------------------------------------------------------------------
@@ -420,7 +438,7 @@ class MediaSelect(discord.ui.Select):
         await interaction.response.defer()
         self._parent.selected = int(self.values[0])
         await self._parent.enrich_selected()
-        await self._parent.refresh()
+        await self._parent.refresh(interaction)
 
 
 class TabButton(discord.ui.Button):
@@ -436,7 +454,7 @@ class TabButton(discord.ui.Button):
         await interaction.response.defer()
         self._parent.tab = self._tab
         self._parent.review_page = 0
-        await self._parent.refresh()
+        await self._parent.refresh(interaction)
 
 
 class RateButton(discord.ui.Button):
@@ -475,7 +493,7 @@ class DeleteReviewButton(discord.ui.Button):
         await self._parent.cog.delete_review(self._parent.guild, interaction.user.id, self._parent.hit)
         self._parent.my_review = None
         await self._parent.reload_stats()
-        await self._parent.refresh()
+        await self._parent.refresh(interaction)
         await interaction.followup.send("**Critique supprimée ·** Ta note a été retirée.", ephemeral=True)
 
 
@@ -498,16 +516,34 @@ class PublishFicheButton(discord.ui.Button):
         view._message = await interaction.followup.send(view=view, allowed_mentions=NO_PINGS)
 
 
-class PageButton(discord.ui.Button):
-    def __init__(self, parent: "PagedView", delta: int, label: str):
-        super().__init__(label=label, style=discord.ButtonStyle.secondary)
+class HubTabButton(discord.ui.Button):
+    def __init__(self, parent: Any, tab: str, label: str):
+        super().__init__(
+            label=label,
+            style=discord.ButtonStyle.primary if parent.tab == tab else discord.ButtonStyle.secondary,
+        )
         self._parent = parent
-        self._delta = delta
+        self._tab = tab
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
-        self._parent.page = max(0, min(self._parent.max_page, self._parent.page + self._delta))
-        await self._parent.refresh()
+        self._parent.tab = self._tab
+        await self._parent.refresh(interaction)
+
+
+class HubPageButton(discord.ui.Button):
+    def __init__(self, parent: Any, attr: str, delta: int, label: str, max_page: int):
+        super().__init__(label=label, style=discord.ButtonStyle.secondary)
+        self._parent = parent
+        self._attr = attr
+        self._delta = delta
+        self._max_page = max_page
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        current = getattr(self._parent, self._attr)
+        setattr(self._parent, self._attr, max(0, min(self._max_page, current + self._delta)))
+        await self._parent.refresh(interaction)
 
 
 class MediaSessionView(discord.ui.LayoutView):
@@ -591,7 +627,7 @@ class MediaSessionView(discord.ui.LayoutView):
         await self.reload_stats()
         self.pending_rating = None
         self.tab = "fiche"
-        await self.refresh()
+        await self.refresh(interaction)
         verb = "enregistrée" if created else "mise à jour"
         parts = [f"**Critique {verb} ·** {format_stars(rating)}  **{rating:g}/5** — {self.hit.title}."]
         if award.gained:
@@ -620,6 +656,17 @@ class MediaSessionView(discord.ui.LayoutView):
             row = discord.ui.ActionRow()
             row.add_item(MediaSelect(self, self.hits, self.selected))
             container.add_item(row)
+            if not any(hit.source == "tmdb" for hit in self.hits) and any(
+                hit.source == "spotify" for hit in self.hits
+            ):
+                if self.cog.catalog is not None and not self.cog.catalog.tmdb.available:
+                    container.add_item(discord.ui.TextDisplay(
+                        "-# Films et séries absents · clé TMDB manquante."
+                    ))
+                else:
+                    container.add_item(discord.ui.TextDisplay(
+                        "-# Aucun film ou série trouvé — précise le type si besoin."
+                    ))
             container.add_item(discord.ui.Separator())
 
         if self.tab == "fiche":
@@ -694,16 +741,21 @@ class MediaSessionView(discord.ui.LayoutView):
 
         self.add_item(container)
 
-    async def refresh(self) -> None:
+    async def refresh(self, interaction: discord.Interaction | None = None) -> None:
         await self.reload_stats()
         self._build()
         try:
-            if self._message is not None:
+            if interaction is not None:
+                if interaction.response.is_done():
+                    await interaction.edit_original_response(view=self, allowed_mentions=NO_PINGS)
+                else:
+                    await interaction.response.edit_message(view=self, allowed_mentions=NO_PINGS)
+            elif self._message is not None:
                 await self._message.edit(view=self, allowed_mentions=NO_PINGS)
-            elif self._interaction:
+            elif self._interaction is not None:
                 await self._interaction.edit_original_response(view=self, allowed_mentions=NO_PINGS)
-        except discord.HTTPException:
-            logger.warning("Impossible de rafraîchir la fiche « %s »", self.hit.title)
+        except discord.HTTPException as exc:
+            logger.warning("Impossible de rafraîchir la fiche « %s » : %s", self.hit.title, exc)
 
     async def start(self, interaction: discord.Interaction, *, deferred: bool = False) -> None:
         self._interaction = interaction
@@ -723,56 +775,15 @@ class _ReviewPageButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
         self._parent.review_page = max(0, self._parent.review_page + self._delta)
-        await self._parent.refresh()
+        await self._parent.refresh(interaction)
 
 
 # ---------------------------------------------------------------------------
-# Listes paginées (journal, catalogue, récentes)
+# Sélections partagées (profil / explorateur)
 # ---------------------------------------------------------------------------
-
-class PagedView(discord.ui.LayoutView):
-    def __init__(self, cog: "Reviews", guild: discord.Guild, *, timeout: float = 300):
-        super().__init__(timeout=timeout)
-        self.cog = cog
-        self.guild = guild
-        self.page = 0
-        self._interaction: discord.Interaction | None = None
-
-    @property
-    def max_page(self) -> int:
-        return 0
-
-    async def refresh(self) -> None:
-        self._build()
-        if self._interaction:
-            await self._interaction.edit_original_response(view=self, allowed_mentions=NO_PINGS)
-
-    def _build(self) -> None:
-        raise NotImplementedError
-
-    def _nav_row(self) -> discord.ui.ActionRow | None:
-        if self.max_page <= 0:
-            return None
-        row = discord.ui.ActionRow()
-        prev_btn = PageButton(self, -1, "← Précédent")
-        next_btn = PageButton(self, 1, "Suivant →")
-        prev_btn.disabled = self.page <= 0
-        next_btn.disabled = self.page >= self.max_page
-        row.add_item(prev_btn)
-        row.add_item(next_btn)
-        return row
-
-    async def start(self, interaction: discord.Interaction, *, deferred: bool = False, ephemeral: bool = False) -> None:
-        self._interaction = interaction
-        self._build()
-        if deferred:
-            await interaction.edit_original_response(view=self, allowed_mentions=NO_PINGS)
-        else:
-            await interaction.response.send_message(view=self, ephemeral=ephemeral, allowed_mentions=NO_PINGS)
-
 
 class JournalOpenSelect(discord.ui.Select):
-    def __init__(self, parent: "JournalView", page_items: list[tuple[MediaHit, Any]]):
+    def __init__(self, parent: "ProfileView", page_items: list[tuple[MediaHit, Any]]):
         options = [
             discord.SelectOption(
                 label=pretty.shorten_text(f"{format_stars_compact(row['rating'])}  {hit.title}", 95),
@@ -789,73 +800,11 @@ class JournalOpenSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction) -> None:
         hit, _row = self._items[int(self.values[0])]
         await interaction.response.defer()
-        view = MediaSessionView(self._parent.cog, self._parent.guild, [hit], author_id=interaction.user.id, ephemeral=False)
-        await view.prepare()
-        view._interaction = interaction
-        view._message = await interaction.followup.send(view=view, allowed_mentions=NO_PINGS)
-
-
-class JournalView(PagedView):
-    def __init__(
-        self,
-        cog: "Reviews",
-        guild: discord.Guild,
-        member: discord.Member | discord.User,
-        entries: list[tuple[MediaHit, Any]],
-        *,
-        average: float | None,
-        title: str,
-    ):
-        super().__init__(cog, guild)
-        self.member = member
-        self.entries = entries
-        self.average = average
-        self.title = title
-
-    @property
-    def max_page(self) -> int:
-        return max(0, (len(self.entries) - 1) // JOURNAL_PAGE)
-
-    def _build(self) -> None:
-        self.clear_items()
-        container = discord.ui.Container()
-        stats = f"{len(self.entries)} note{'s' if len(self.entries) != 1 else ''}"
-        if self.average is not None:
-            stats += f"  ·  moyenne {format_stars(self.average)} {self.average:.1f}/5"
-        types = {}
-        for hit, _ in self.entries:
-            types[hit.media_type] = types.get(hit.media_type, 0) + 1
-        if types:
-            top_type = max(types, key=types.get)
-            stats += f"  ·  {types[top_type]} {type_label(top_type).lower()}{'s' if types[top_type] > 1 else ''}"
-        header = f"{_titled(_mention(self.guild, self.cog.bot, self.member.id), self.title)}\n-# {stats}"
-        container.add_item(discord.ui.TextDisplay(header))
-        container.add_item(discord.ui.Separator())
-
-        if not self.entries:
-            container.add_item(discord.ui.TextDisplay("*Aucune œuvre notée pour l'instant.*"))
-        else:
-            start = self.page * JOURNAL_PAGE
-            page_items = self.entries[start:start + JOURNAL_PAGE]
-            for hit, row in page_items:
-                year = f" ({hit.year})" if hit.year else ""
-                text = f"{format_stars(row['rating'])}  **{hit.title}**{year}\n-# {type_label(hit.media_type)}"
-                if row["comment"]:
-                    text += f"\n{pretty.shorten_text(row['comment'], 180)}"
-                container.add_item(section_with_thumbnail(text, hit.poster_url))
-            container.add_item(discord.ui.TextDisplay(f"-# Page {self.page + 1}/{self.max_page + 1}"))
-            select_row = discord.ui.ActionRow()
-            select_row.add_item(JournalOpenSelect(self, page_items))
-            container.add_item(select_row)
-
-        nav = self._nav_row()
-        if nav:
-            container.add_item(nav)
-        self.add_item(container)
+        await open_public_fiche(self._parent.cog, self._parent.guild, interaction, hit)
 
 
 class CatalogOpenSelect(discord.ui.Select):
-    def __init__(self, parent: "CatalogView", page_items: list[tuple[MediaHit, float, int]]):
+    def __init__(self, parent: "ServerHubView", page_items: list[tuple[MediaHit, float, int]]):
         options = [
             discord.SelectOption(
                 label=pretty.shorten_text(hit.title, 95),
@@ -875,61 +824,11 @@ class CatalogOpenSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction) -> None:
         hit, _avg, _count = self._items[int(self.values[0])]
         await interaction.response.defer()
-        view = MediaSessionView(self._parent.cog, self._parent.guild, [hit], author_id=interaction.user.id, ephemeral=False)
-        await view.prepare()
-        view._interaction = interaction
-        view._message = await interaction.followup.send(view=view, allowed_mentions=NO_PINGS)
-
-
-class CatalogView(PagedView):
-    def __init__(
-        self,
-        cog: "Reviews",
-        guild: discord.Guild,
-        items: list[tuple[MediaHit, float, int]],
-        *,
-        title: str,
-        subtitle: str,
-    ):
-        super().__init__(cog, guild)
-        self.items = items
-        self.title = title
-        self.subtitle = subtitle
-
-    @property
-    def max_page(self) -> int:
-        return max(0, (len(self.items) - 1) // CATALOG_PAGE)
-
-    def _build(self) -> None:
-        self.clear_items()
-        container = discord.ui.Container()
-        container.add_item(discord.ui.TextDisplay(f"## {self.title}\n-# {self.subtitle}"))
-        container.add_item(discord.ui.Separator())
-        if not self.items:
-            container.add_item(discord.ui.TextDisplay("*Aucune œuvre ne correspond à cette recherche.*"))
-        else:
-            start = self.page * CATALOG_PAGE
-            page_items = self.items[start:start + CATALOG_PAGE]
-            lines = []
-            for index, (hit, avg, count) in enumerate(page_items, start=start + 1):
-                year = f" ({hit.year})" if hit.year else ""
-                lines.append(
-                    f"**{index}.** {format_stars(avg)}  **{hit.title}**{year}  ·  {type_label(hit.media_type)}  ·  {count} note{'s' if count > 1 else ''}"
-                )
-            container.add_item(discord.ui.TextDisplay("\n".join(lines)))
-            select_row = discord.ui.ActionRow()
-            select_row.add_item(CatalogOpenSelect(self, page_items))
-            container.add_item(select_row)
-            if self.max_page > 0:
-                container.add_item(discord.ui.TextDisplay(f"-# Page {self.page + 1}/{self.max_page + 1}"))
-        nav = self._nav_row()
-        if nav:
-            container.add_item(nav)
-        self.add_item(container)
+        await open_public_fiche(self._parent.cog, self._parent.guild, interaction, hit)
 
 
 class RecentOpenSelect(discord.ui.Select):
-    def __init__(self, parent: "RecentView", page_items: list[tuple[MediaHit, Any]]):
+    def __init__(self, parent: "ServerHubView", page_items: list[tuple[MediaHit, Any]]):
         options = [
             discord.SelectOption(
                 label=pretty.shorten_text(hit.title, 95),
@@ -946,66 +845,11 @@ class RecentOpenSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction) -> None:
         hit, _row = self._items[int(self.values[0])]
         await interaction.response.defer()
-        view = MediaSessionView(self._parent.cog, self._parent.guild, [hit], author_id=interaction.user.id, ephemeral=False)
-        await view.prepare()
-        view._interaction = interaction
-        view._message = await interaction.followup.send(view=view, allowed_mentions=NO_PINGS)
+        await open_public_fiche(self._parent.cog, self._parent.guild, interaction, hit)
 
-
-class RecentView(PagedView):
-    def __init__(
-        self,
-        cog: "Reviews",
-        guild: discord.Guild,
-        entries: list[tuple[MediaHit, Any]],
-        *,
-        titles: dict[int, str],
-    ):
-        super().__init__(cog, guild)
-        self.entries = entries
-        self.titles = titles
-
-    @property
-    def max_page(self) -> int:
-        return max(0, (len(self.entries) - 1) // JOURNAL_PAGE)
-
-    def _build(self) -> None:
-        self.clear_items()
-        container = discord.ui.Container()
-        container.add_item(discord.ui.TextDisplay(f"## Dernières critiques\n-# {len(self.entries)} récente(s) sur ce serveur"))
-        container.add_item(discord.ui.Separator())
-        if not self.entries:
-            container.add_item(discord.ui.TextDisplay("*Personne n'a encore noté d'œuvre ici.*"))
-        else:
-            start = self.page * JOURNAL_PAGE
-            page_items = self.entries[start:start + JOURNAL_PAGE]
-            for hit, row in page_items:
-                user_id = int(row["user_id"])
-                _name, avatar = _user_display(self.guild, self.cog.bot, user_id)
-                year = f" ({hit.year})" if hit.year else ""
-                text = (
-                    f"{_titled(_mention(self.guild, self.cog.bot, user_id), self.titles.get(user_id, title_for_level(1)))}\n"
-                    f"{format_stars(row['rating'])}  **{row['rating']:g}/5**\n"
-                    f"**{hit.title}**{year} · {type_label(hit.media_type)} · <t:{row['updated_at']}:R>"
-                )
-                if row["comment"]:
-                    text += f"\n*{pretty.shorten_text(row['comment'], 180)}*"
-                container.add_item(section_with_thumbnail(text, avatar or hit.poster_url))
-            select_row = discord.ui.ActionRow()
-            select_row.add_item(RecentOpenSelect(self, page_items))
-            container.add_item(select_row)
-        nav = self._nav_row()
-        if nav:
-            container.add_item(nav)
-        self.add_item(container)
-
-
-# ---------------------------------------------------------------------------
-# Affinités & profil
-# ---------------------------------------------------------------------------
 
 class AffinityCompareSelect(discord.ui.Select):
-    def __init__(self, parent: "AffinityHubView", affinities: list[Affinity]):
+    def __init__(self, parent: "ProfileView"):
         options = [
             discord.SelectOption(
                 label=pretty.shorten_text(parent._name(item.user_id), 95),
@@ -1015,7 +859,7 @@ class AffinityCompareSelect(discord.ui.Select):
                     95,
                 ),
             )
-            for item in affinities[:25]
+            for item in parent.affinities[:25]
         ]
         super().__init__(placeholder="Comparer avec…", options=options)
         self._parent = parent
@@ -1026,74 +870,13 @@ class AffinityCompareSelect(discord.ui.Select):
         view = AffinityCompareView(
             self._parent.cog,
             self._parent.guild,
-            self._parent.member_id,
+            self._parent.member.id,
             other_id,
             affinity=next(a for a in self._parent.affinities if a.user_id == other_id),
             titles=self._parent.titles,
         )
         view._interaction = interaction
         view._message = await interaction.followup.send(view=view, allowed_mentions=NO_PINGS)
-
-
-class AffinityHubView(PagedView):
-    def __init__(
-        self,
-        cog: "Reviews",
-        guild: discord.Guild,
-        member_id: int,
-        affinities: list[Affinity],
-        *,
-        titles: dict[int, str],
-    ):
-        super().__init__(cog, guild)
-        self.member_id = member_id
-        self.affinities = sorted(affinities, key=lambda a: (-a.percent, -a.overlap))
-        self.titles = titles
-
-    def _name(self, user_id: int) -> str:
-        name, _avatar = _user_display(self.guild, self.cog.bot, user_id)
-        return name
-
-    def _person(self, user_id: int) -> str:
-        return _titled(
-            _mention(self.guild, self.cog.bot, user_id),
-            self.titles.get(user_id, title_for_level(1)),
-        )
-
-    def _build(self) -> None:
-        self.clear_items()
-        container = discord.ui.Container()
-        _me, avatar = _user_display(self.guild, self.cog.bot, self.member_id)
-        if not self.affinities:
-            container.add_item(section_with_thumbnail(
-                f"{self._person(self.member_id)}\n*Pas encore assez d'œuvres en commun avec quelqu'un "
-                f"(minimum {MIN_AFFINITY_OVERLAP}). Notez les mêmes films, jeux ou albums.*",
-                avatar,
-            ))
-            self.add_item(container)
-            return
-
-        twins = self.affinities[:3]
-        rival = min(self.affinities, key=lambda a: (a.percent, -a.overlap))
-        lines = [
-            self._person(self.member_id),
-            f"-# {len(self.affinities)} affinité(s) · min. {MIN_AFFINITY_OVERLAP} œuvres en commun",
-            "",
-            f"{TWIN} **Jumeaux**",
-        ]
-        for twin in twins:
-            lines.append(self._person(twin.user_id))
-            lines.append(f"-# {twin.percent:.0f} % · {twin.overlap} en commun")
-        if rival.user_id not in {t.user_id for t in twins}:
-            lines.append("")
-            lines.append(f"{RIVAL} **Rival**")
-            lines.append(self._person(rival.user_id))
-            lines.append(f"-# {rival.percent:.0f} %")
-        container.add_item(section_with_thumbnail("\n".join(lines), avatar))
-        select_row = discord.ui.ActionRow()
-        select_row.add_item(AffinityCompareSelect(self, self.affinities))
-        container.add_item(select_row)
-        self.add_item(container)
 
 
 class AffinityCompareView(discord.ui.LayoutView):
@@ -1148,6 +931,149 @@ class AffinityCompareView(discord.ui.LayoutView):
         self.add_item(container)
 
 
+class FavoriteSlotButton(discord.ui.Button):
+    def __init__(self, parent: "ProfileView", slot: int, filled: bool):
+        label = FAVORITE_LABELS[slot]
+        super().__init__(
+            label=label,
+            style=discord.ButtonStyle.secondary if filled else discord.ButtonStyle.green,
+        )
+        self._parent = parent
+        self._slot = slot
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self._parent.member.id:
+            await interaction.response.send_message(
+                "**Action impossible ·** Seul le propriétaire du profil peut modifier ses préférées.",
+                ephemeral=True,
+                delete_after=10,
+            )
+            return
+        await interaction.response.send_modal(FavoriteSearchModal(self._parent, self._slot))
+
+
+class FavoriteClearSelect(discord.ui.Select):
+    def __init__(self, parent: "ProfileView", filled: list[int]):
+        options = [
+            discord.SelectOption(
+                label=pretty.shorten_text(f"Retirer · {FAVORITE_LABELS[slot]}", 95),
+                value=str(slot),
+                description="Enlever cette œuvre du profil",
+            )
+            for slot in filled
+        ]
+        super().__init__(placeholder="Retirer une préférée…", options=options, min_values=1, max_values=1)
+        self._parent = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self._parent.member.id:
+            await interaction.response.send_message(
+                "**Action impossible ·** Seul le propriétaire du profil peut modifier ses préférées.",
+                ephemeral=True,
+                delete_after=10,
+            )
+            return
+        await interaction.response.defer()
+        slot = int(self.values[0])
+        await self._parent.cog.clear_favorite(self._parent.guild, self._parent.member.id, slot)
+        await self._parent.refresh(interaction)
+        await interaction.followup.send(
+            f"**Préférée retirée ·** {FAVORITE_LABELS[slot]} est de nouveau vide.",
+            ephemeral=True,
+        )
+
+
+class FavoriteSearchModal(discord.ui.Modal):
+    def __init__(self, profile: "ProfileView", slot: int):
+        super().__init__(title=pretty.shorten_text(f"Choisir · {FAVORITE_LABELS[slot]}", 45))
+        self._profile = profile
+        self._slot = slot
+        self.query_input = discord.ui.TextInput(
+            label="Titre de l'œuvre",
+            placeholder="Ex. Inception, Dune 2021, Disco Elysium…",
+            min_length=2,
+            max_length=80,
+        )
+        self.add_item(self.query_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        catalog = self._profile.cog.catalog
+        if catalog is None:
+            await interaction.followup.send("**Erreur ·** Catalogue média indisponible.", ephemeral=True)
+            return
+        query = str(self.query_input.value).strip()
+        try:
+            hits = await catalog.search(query, "all")
+        except Exception:
+            logger.exception("Recherche de préférée impossible")
+            await interaction.followup.send("**Erreur ·** Recherche impossible pour le moment.", ephemeral=True)
+            return
+        if not hits:
+            await interaction.followup.send(
+                f"**Erreur ·** Aucun résultat pour « {pretty.shorten_text(query, 80)} ».",
+                ephemeral=True,
+            )
+            return
+        if len(hits) == 1:
+            await self._profile.apply_favorite(self._slot, hits[0])
+            await interaction.followup.send(
+                f"**{FAVORITE_LABELS[self._slot]} ·** {hits[0].title}",
+                ephemeral=True,
+            )
+            return
+        view = FavoritePickView(self._profile, self._slot, hits)
+        await interaction.followup.send(view=view, ephemeral=True)
+
+
+class FavoriteHitSelect(discord.ui.Select):
+    def __init__(self, parent: "FavoritePickView", hits: list[MediaHit]):
+        options = []
+        for index, hit in enumerate(hits[:25]):
+            year = f"{hit.year}" if hit.year else "—"
+            desc_parts = [type_label(hit.media_type), year]
+            if hit.subtitle:
+                desc_parts.append(hit.subtitle)
+            options.append(
+                discord.SelectOption(
+                    label=pretty.shorten_text(hit.title, 95) or "Sans titre",
+                    value=str(index),
+                    description=pretty.shorten_text(" · ".join(desc_parts), 95),
+                    emoji=select_emoji(hit.media_type),
+                )
+            )
+        super().__init__(placeholder="Choisir une œuvre", options=options, min_values=1, max_values=1)
+        self._parent = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        hit = self._parent.hits[int(self.values[0])]
+        await self._parent.profile.apply_favorite(self._parent.slot, hit)
+        done = discord.ui.LayoutView(timeout=30)
+        box = discord.ui.Container()
+        box.add_item(discord.ui.TextDisplay(
+            f"**{FAVORITE_LABELS[self._parent.slot]} ·** {hit.title}"
+        ))
+        done.add_item(box)
+        await interaction.edit_original_response(view=done)
+
+
+class FavoritePickView(discord.ui.LayoutView):
+    def __init__(self, profile: "ProfileView", slot: int, hits: list[MediaHit]):
+        super().__init__(timeout=180)
+        self.profile = profile
+        self.slot = slot
+        self.hits = hits
+        container = discord.ui.Container()
+        container.add_item(discord.ui.TextDisplay(
+            f"## {FAVORITE_LABELS[slot]}\n-# {len(hits)} résultat(s) — choisis l'œuvre à épingler"
+        ))
+        row = discord.ui.ActionRow()
+        row.add_item(FavoriteHitSelect(self, hits))
+        container.add_item(row)
+        self.add_item(container)
+
+
 class ProfileView(discord.ui.LayoutView):
     def __init__(
         self,
@@ -1161,6 +1087,11 @@ class ProfileView(discord.ui.LayoutView):
         twin: Affinity | None,
         rival: Affinity | None,
         titles: dict[int, str],
+        favorites: list[tuple[MediaHit, float | None] | None],
+        journal_entries: list[tuple[MediaHit, Any]],
+        affinities: list[Affinity],
+        editable: bool,
+        tab: str = "profil",
     ):
         super().__init__(timeout=300)
         self.cog = cog
@@ -1172,7 +1103,21 @@ class ProfileView(discord.ui.LayoutView):
         self.twin = twin
         self.rival = rival
         self.titles = titles
+        self.favorites = favorites
+        self.journal_entries = journal_entries
+        self.affinities = sorted(affinities, key=lambda a: (-a.percent, -a.overlap))
+        self.editable = editable
+        self.tab = tab
+        self.journal_page = 0
+        self._interaction: discord.Interaction | None = None
         self._build()
+
+    def _display_name(self) -> str:
+        return self.member.display_name if hasattr(self.member, "display_name") else str(self.member)
+
+    def _name(self, user_id: int) -> str:
+        name, _avatar = _user_display(self.guild, self.cog.bot, user_id)
+        return name
 
     def _person(self, user_id: int) -> str:
         return _titled(
@@ -1180,30 +1125,362 @@ class ProfileView(discord.ui.LayoutView):
             self.titles.get(user_id, title_for_level(1)),
         )
 
+    def _add_tabs(self, container: discord.ui.Container) -> None:
+        tabs = discord.ui.ActionRow()
+        tabs.add_item(HubTabButton(self, "profil", "Profil"))
+        tabs.add_item(HubTabButton(self, "journal", f"Journal ({self.review_count})"))
+        tabs.add_item(HubTabButton(self, "affinites", "Affinités"))
+        container.add_item(tabs)
+
+    def _add_page_nav(self, container: discord.ui.Container, attr: str, max_page: int) -> None:
+        if max_page <= 0:
+            return
+        page = getattr(self, attr)
+        nav = discord.ui.ActionRow()
+        prev_btn = HubPageButton(self, attr, -1, "← Précédent", max_page)
+        next_btn = HubPageButton(self, attr, 1, "Suivant →", max_page)
+        prev_btn.disabled = page <= 0
+        next_btn.disabled = page >= max_page
+        nav.add_item(prev_btn)
+        nav.add_item(next_btn)
+        container.add_item(nav)
+
+    def _build_profil(self, container: discord.ui.Container) -> None:
+        level, into, need, total = level_progress(self.xp)
+        title = title_for_level(level)
+        stats = f"**{self.review_count}** note{'s' if self.review_count != 1 else ''}"
+        if self.average is not None:
+            stats += f"  ·  moyenne **{self.average:.1f}/5**"
+        header = (
+            f"## {pretty.shorten_text(self._display_name(), 80)}\n"
+            f"{_mention(self.guild, self.cog.bot, self.member.id)}\n"
+            f"-# {title}\n"
+            f"{XP} **{total} XP** · niveau **{level}**\n"
+            f"-# {into}/{need} vers le niveau {level + 1}\n"
+            f"{stats}"
+        )
+        avatar = self.member.display_avatar.url if hasattr(self.member, "display_avatar") else None
+        container.add_item(section_with_thumbnail(header, avatar))
+        container.add_item(discord.ui.Separator())
+        for index, (slot, label) in enumerate(FAVORITE_LABELS.items()):
+            if index:
+                container.add_item(discord.ui.Separator())
+            entry = self.favorites[slot - 1] if slot - 1 < len(self.favorites) else None
+            if entry is None:
+                hint = "*Pas encore choisi.*"
+                if self.editable:
+                    hint += "\n-# Appuie sur le bouton pour en épingler une."
+                container.add_item(discord.ui.TextDisplay(f"### {label}\n{hint}"))
+            else:
+                hit, rating = entry
+                year = f"  ·  {hit.year}" if hit.year else ""
+                lines = [
+                    f"### {label}",
+                    f"{type_emoji(hit.media_type)} **{hit.title}**{year}",
+                    f"-# {type_label(hit.media_type)}"
+                    + (f"  ·  {hit.subtitle}" if hit.subtitle else ""),
+                ]
+                if rating is not None:
+                    lines.append(f"{format_stars(rating)}  **{rating:g}/5**")
+                container.add_item(section_with_thumbnail("\n".join(lines), hit.poster_url))
+        if self.editable:
+            actions = discord.ui.ActionRow()
+            for slot in FAVORITE_LABELS:
+                filled = bool(self.favorites[slot - 1] if slot - 1 < len(self.favorites) else None)
+                actions.add_item(FavoriteSlotButton(self, slot, filled))
+            container.add_item(actions)
+            filled_slots = [
+                slot for slot in FAVORITE_LABELS
+                if slot - 1 < len(self.favorites) and self.favorites[slot - 1] is not None
+            ]
+            if filled_slots:
+                clear_row = discord.ui.ActionRow()
+                clear_row.add_item(FavoriteClearSelect(self, filled_slots))
+                container.add_item(clear_row)
+
+    def _build_journal(self, container: discord.ui.Container) -> None:
+        stats = f"{len(self.journal_entries)} note{'s' if len(self.journal_entries) != 1 else ''}"
+        if self.average is not None:
+            stats += f"  ·  moyenne {format_stars(self.average)} {self.average:.1f}/5"
+        types: dict[str, int] = {}
+        for hit, _row in self.journal_entries:
+            types[hit.media_type] = types.get(hit.media_type, 0) + 1
+        if types:
+            top_type = max(types, key=types.get)
+            stats += f"  ·  {types[top_type]} {type_label(top_type).lower()}{'s' if types[top_type] > 1 else ''}"
+        container.add_item(discord.ui.TextDisplay(
+            f"## {pretty.shorten_text(self._display_name(), 80)}\n-# Journal · {stats}"
+        ))
+        if not self.journal_entries:
+            container.add_item(discord.ui.TextDisplay("*Aucune œuvre notée pour l'instant.*"))
+            return
+        max_page = max(0, (len(self.journal_entries) - 1) // JOURNAL_PAGE)
+        self.journal_page = min(self.journal_page, max_page)
+        start = self.journal_page * JOURNAL_PAGE
+        page_items = self.journal_entries[start:start + JOURNAL_PAGE]
+        for hit, row in page_items:
+            year = f" ({hit.year})" if hit.year else ""
+            text = f"{format_stars(row['rating'])}  **{hit.title}**{year}\n-# {type_label(hit.media_type)}"
+            if row["comment"]:
+                text += f"\n{pretty.shorten_text(row['comment'], 180)}"
+            container.add_item(section_with_thumbnail(text, hit.poster_url))
+        select_row = discord.ui.ActionRow()
+        select_row.add_item(JournalOpenSelect(self, page_items))
+        container.add_item(select_row)
+        self._add_page_nav(container, "journal_page", max_page)
+
+    def _build_affinites(self, container: discord.ui.Container) -> None:
+        _me, avatar = _user_display(self.guild, self.cog.bot, self.member.id)
+        if not self.affinities:
+            container.add_item(section_with_thumbnail(
+                f"## {pretty.shorten_text(self._display_name(), 80)}\n"
+                f"{self._person(self.member.id)}\n"
+                f"*Pas encore assez d'œuvres en commun avec quelqu'un "
+                f"(minimum {MIN_AFFINITY_OVERLAP}).*",
+                avatar,
+            ))
+            return
+        twins = self.affinities[:3]
+        rival = min(self.affinities, key=lambda a: (a.percent, -a.overlap))
+        lines = [
+            f"## {pretty.shorten_text(self._display_name(), 80)}",
+            self._person(self.member.id),
+            f"-# {len(self.affinities)} affinité(s) · min. {MIN_AFFINITY_OVERLAP} en commun",
+            "",
+            f"### {TWIN} Jumeaux",
+        ]
+        for twin in twins:
+            lines.append(self._person(twin.user_id))
+            lines.append(f"-# {twin.percent:.0f} % · {twin.overlap} en commun")
+        if rival.user_id not in {t.user_id for t in twins}:
+            lines.append("")
+            lines.append(f"### {RIVAL} Rival")
+            lines.append(self._person(rival.user_id))
+            lines.append(f"-# {rival.percent:.0f} %")
+        container.add_item(section_with_thumbnail("\n".join(lines), avatar))
+        select_row = discord.ui.ActionRow()
+        select_row.add_item(AffinityCompareSelect(self))
+        container.add_item(select_row)
+
     def _build(self) -> None:
         self.clear_items()
         container = discord.ui.Container()
-        level, into, need, total = level_progress(self.xp)
-        stats = f"{self.review_count} note{'s' if self.review_count != 1 else ''}"
-        if self.average is not None:
-            stats += f"  ·  moyenne {self.average:.1f}/5"
-        title = title_for_level(level)
-        body = [
-            _titled(_mention(self.guild, self.cog.bot, self.member.id), title),
-            f"{XP} {total} XP · niveau {level} · {into}/{need} vers le niveau {level + 1}",
-            f"-# {stats}",
-        ]
-        if self.twin:
-            body.append(f"{TWIN} Jumeau")
-            body.append(self._person(self.twin.user_id))
-            body.append(f"-# {self.twin.percent:.0f} % d'accord")
-        if self.rival and (not self.twin or self.rival.user_id != self.twin.user_id):
-            body.append(f"{RIVAL} Rival")
-            body.append(self._person(self.rival.user_id))
-            body.append(f"-# {self.rival.percent:.0f} % d'accord")
-        avatar = self.member.display_avatar.url if hasattr(self.member, "display_avatar") else None
-        container.add_item(section_with_thumbnail("\n".join(body), avatar))
+        if self.tab == "journal":
+            self._build_journal(container)
+        elif self.tab == "affinites":
+            self._build_affinites(container)
+        else:
+            self._build_profil(container)
+        self._add_tabs(container)
         self.add_item(container)
+
+    async def apply_favorite(self, slot: int, hit: MediaHit) -> None:
+        if self.cog.catalog is not None:
+            try:
+                hit = await self.cog.catalog.enrich(hit)
+            except Exception:
+                logger.exception("Enrichissement de préférée impossible")
+        await self.cog.set_favorite(self.guild, self.member.id, slot, hit)
+        await self.refresh()
+
+    async def refresh(self, interaction: discord.Interaction | None = None) -> None:
+        self.favorites = await self.cog.get_favorites(self.guild, self.member.id)
+        self._build()
+        editor = interaction or self._interaction
+        if editor is None:
+            return
+        try:
+            if editor.response.is_done():
+                await editor.edit_original_response(view=self, allowed_mentions=NO_PINGS)
+            else:
+                await editor.response.edit_message(view=self, allowed_mentions=NO_PINGS)
+        except discord.HTTPException as exc:
+            logger.warning("Impossible de rafraîchir le profil : %s", exc)
+
+
+class TopPeriodSelect(discord.ui.Select):
+    def __init__(self, parent: "ServerHubView"):
+        options = [
+            discord.SelectOption(label="Toutes périodes", value="all", default=parent.period == "all"),
+            discord.SelectOption(label="Cette semaine", value="semaine", default=parent.period == "semaine"),
+            discord.SelectOption(label="Ce mois", value="mois", default=parent.period == "mois"),
+        ]
+        super().__init__(placeholder="Période du top", options=options, min_values=1, max_values=1)
+        self._parent = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        self._parent.period = self.values[0]
+        self._parent.top_page = 0
+        self._parent.top_items = await self._parent.cog.load_top(
+            self._parent.guild,
+            media_type=self._parent.media_type,
+            period=self._parent.period,
+        )
+        await self._parent.refresh(interaction)
+
+
+class ServerHubView(discord.ui.LayoutView):
+    """Récentes, catalogue et top du serveur, dans une seule vue à onglets."""
+
+    def __init__(
+        self,
+        cog: "Reviews",
+        guild: discord.Guild,
+        *,
+        recent: list[tuple[MediaHit, Any]],
+        catalog: list[tuple[MediaHit, float, int]],
+        top: list[tuple[MediaHit, float, int]],
+        titles: dict[int, str],
+        catalog_subtitle: str,
+        media_type: str = "all",
+        period: str = "all",
+        tab: str = "recentes",
+    ):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild = guild
+        self.recent = recent
+        self.catalog = catalog
+        self.top_items = top
+        self.titles = titles
+        self.catalog_subtitle = catalog_subtitle
+        self.media_type = media_type
+        self.period = period
+        self.tab = tab
+        self.recent_page = 0
+        self.catalog_page = 0
+        self.top_page = 0
+        self._interaction: discord.Interaction | None = None
+        self._build()
+
+    def _add_tabs(self, container: discord.ui.Container) -> None:
+        tabs = discord.ui.ActionRow()
+        tabs.add_item(HubTabButton(self, "recentes", "Récentes"))
+        tabs.add_item(HubTabButton(self, "catalogue", f"Catalogue ({len(self.catalog)})"))
+        tabs.add_item(HubTabButton(self, "top", "Top"))
+        container.add_item(tabs)
+
+    def _add_page_nav(self, container: discord.ui.Container, attr: str, max_page: int) -> None:
+        if max_page <= 0:
+            return
+        page = getattr(self, attr)
+        nav = discord.ui.ActionRow()
+        prev_btn = HubPageButton(self, attr, -1, "← Précédent", max_page)
+        next_btn = HubPageButton(self, attr, 1, "Suivant →", max_page)
+        prev_btn.disabled = page <= 0
+        next_btn.disabled = page >= max_page
+        nav.add_item(prev_btn)
+        nav.add_item(next_btn)
+        container.add_item(nav)
+
+    def _build_ranked(
+        self,
+        container: discord.ui.Container,
+        *,
+        title: str,
+        subtitle: str,
+        items: list[tuple[MediaHit, float, int]],
+        page_attr: str,
+        extra_row: discord.ui.ActionRow | None = None,
+    ) -> None:
+        container.add_item(discord.ui.TextDisplay(f"## {title}\n-# {subtitle}"))
+        if not items:
+            container.add_item(discord.ui.TextDisplay("*Aucune œuvre ne correspond à cette recherche.*"))
+            if extra_row:
+                container.add_item(extra_row)
+            return
+        max_page = max(0, (len(items) - 1) // CATALOG_PAGE)
+        page = min(getattr(self, page_attr), max_page)
+        setattr(self, page_attr, page)
+        start = page * CATALOG_PAGE
+        page_items = items[start:start + CATALOG_PAGE]
+        lines = []
+        for index, (hit, avg, count) in enumerate(page_items, start=start + 1):
+            year = f" ({hit.year})" if hit.year else ""
+            lines.append(
+                f"**{index}.** {format_stars(avg)}  **{hit.title}**{year}  ·  "
+                f"{type_label(hit.media_type)}  ·  {count} note{'s' if count > 1 else ''}"
+            )
+        container.add_item(discord.ui.TextDisplay("\n".join(lines)))
+        select_row = discord.ui.ActionRow()
+        select_row.add_item(CatalogOpenSelect(self, page_items))
+        container.add_item(select_row)
+        if extra_row:
+            container.add_item(extra_row)
+        self._add_page_nav(container, page_attr, max_page)
+
+    def _build_recentes(self, container: discord.ui.Container) -> None:
+        container.add_item(discord.ui.TextDisplay(
+            f"## Dernières critiques\n-# {len(self.recent)} récente(s) sur ce serveur"
+        ))
+        if not self.recent:
+            container.add_item(discord.ui.TextDisplay("*Personne n'a encore noté d'œuvre ici.*"))
+            return
+        max_page = max(0, (len(self.recent) - 1) // JOURNAL_PAGE)
+        self.recent_page = min(self.recent_page, max_page)
+        start = self.recent_page * JOURNAL_PAGE
+        page_items = self.recent[start:start + JOURNAL_PAGE]
+        for hit, row in page_items:
+            user_id = int(row["user_id"])
+            _name, avatar = _user_display(self.guild, self.cog.bot, user_id)
+            year = f" ({hit.year})" if hit.year else ""
+            text = (
+                f"{_titled(_mention(self.guild, self.cog.bot, user_id), self.titles.get(user_id, title_for_level(1)))}\n"
+                f"{format_stars(row['rating'])}  **{row['rating']:g}/5**\n"
+                f"**{hit.title}**{year} · {type_label(hit.media_type)} · <t:{row['updated_at']}:R>"
+            )
+            if row["comment"]:
+                text += f"\n*{pretty.shorten_text(row['comment'], 180)}*"
+            container.add_item(section_with_thumbnail(text, avatar or hit.poster_url))
+        select_row = discord.ui.ActionRow()
+        select_row.add_item(RecentOpenSelect(self, page_items))
+        container.add_item(select_row)
+        self._add_page_nav(container, "recent_page", max_page)
+
+    def _build(self) -> None:
+        self.clear_items()
+        container = discord.ui.Container()
+        if self.tab == "catalogue":
+            self._build_ranked(
+                container,
+                title="Catalogue du serveur",
+                subtitle=self.catalog_subtitle,
+                items=self.catalog,
+                page_attr="catalog_page",
+            )
+        elif self.tab == "top":
+            period_label = {"all": "toutes périodes", "semaine": "cette semaine", "mois": "ce mois"}.get(
+                self.period, self.period
+            )
+            type_part = type_label(self.media_type) if self.media_type != "all" else "Tous types"
+            period_row = discord.ui.ActionRow()
+            period_row.add_item(TopPeriodSelect(self))
+            self._build_ranked(
+                container,
+                title="Top du serveur",
+                subtitle=f"{type_part}  ·  {period_label}",
+                items=self.top_items,
+                page_attr="top_page",
+                extra_row=period_row,
+            )
+        else:
+            self._build_recentes(container)
+        self._add_tabs(container)
+        self.add_item(container)
+
+    async def refresh(self, interaction: discord.Interaction | None = None) -> None:
+        self._build()
+        editor = interaction or self._interaction
+        if editor is None:
+            return
+        try:
+            if editor.response.is_done():
+                await editor.edit_original_response(view=self, allowed_mentions=NO_PINGS)
+            else:
+                await editor.response.edit_message(view=self, allowed_mentions=NO_PINGS)
+        except discord.HTTPException as exc:
+            logger.warning("Impossible de rafraîchir l'explorateur : %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1457,19 +1734,34 @@ class Reviews(commands.Cog):
                 last_level INTEGER NOT NULL DEFAULT 1
             )"""
         )
-        self.data.link(discord.Guild, settings, media_table, reviews_table, profiles_table)
+        favorites_table = dataio.TableBuilder(
+            """CREATE TABLE IF NOT EXISTS favorites (
+                user_id INTEGER NOT NULL,
+                slot INTEGER NOT NULL,
+                media_id INTEGER NOT NULL,
+                PRIMARY KEY (user_id, slot)
+            )"""
+        )
+        self.data.link(discord.Guild, settings, media_table, reviews_table, profiles_table, favorites_table)
 
     async def cog_load(self) -> None:
-        config = getattr(self.bot, "config", {}) or {}
+        config = dict(getattr(self.bot, "config", {}) or {})
+        try:
+            from dotenv import dotenv_values
+            for key, value in dotenv_values(".env").items():
+                if value:
+                    config[key] = value
+        except Exception:
+            pass
         self._http = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=10),
             headers={"User-Agent": "ACK-BOT/1.0 (Discord reviews)"},
         )
         self.catalog = MediaCatalog(
             self._http,
-            tmdb_key=str(config.get("TMDB_API_KEY") or ""),
-            spotify_id=str(config.get("SPOTIFY_CLIENT_ID") or ""),
-            spotify_secret=str(config.get("SPOTIFY_CLIENT_SECRET") or ""),
+            tmdb_key=str(config.get("TMDB_API_KEY") or "").strip(),
+            spotify_id=str(config.get("SPOTIFY_CLIENT_ID") or "").strip(),
+            spotify_secret=str(config.get("SPOTIFY_CLIENT_SECRET") or "").strip(),
         )
         status = self.catalog.status()
         missing = [name for name, ok in status.items() if not ok]
@@ -1546,6 +1838,143 @@ class Reviews(commands.Cog):
         )
         xp_by_user = {int(row["user_id"]): int(row["xp"]) for row in rows}
         return {user_id: title_for_level(level_for_xp(xp_by_user.get(user_id, 0))) for user_id in unique}
+
+    async def get_favorites(
+        self, guild: discord.Guild, user_id: int
+    ) -> list[tuple[MediaHit, float | None] | None]:
+        rows = await self.data.get(guild).fetchall(
+            """SELECT f.slot, m.*, r.rating AS fav_rating
+               FROM favorites f
+               JOIN media m ON m.id = f.media_id
+               LEFT JOIN reviews r ON r.media_id = f.media_id AND r.user_id = f.user_id
+               WHERE f.user_id=?""",
+            user_id,
+        )
+        slots: list[tuple[MediaHit, float | None] | None] = [None, None, None]
+        for row in rows:
+            slot = int(row["slot"])
+            if slot < 1 or slot > 3:
+                continue
+            rating = row["fav_rating"]
+            slots[slot - 1] = (hit_from_row(row), float(rating) if rating is not None else None)
+        return slots
+
+    async def set_favorite(
+        self, guild: discord.Guild, user_id: int, slot: int, hit: MediaHit
+    ) -> None:
+        if slot not in FAVORITE_LABELS:
+            return
+        media_id = await self.upsert_media(guild, hit)
+        db = self.data.get(guild)
+        await db.execute("DELETE FROM favorites WHERE user_id=? AND media_id=?", user_id, media_id)
+        await db.execute(
+            """INSERT INTO favorites (user_id, slot, media_id) VALUES (?, ?, ?)
+               ON CONFLICT(user_id, slot) DO UPDATE SET media_id=excluded.media_id""",
+            user_id,
+            slot,
+            media_id,
+        )
+
+    async def clear_favorite(self, guild: discord.Guild, user_id: int, slot: int) -> None:
+        await self.data.get(guild).execute(
+            "DELETE FROM favorites WHERE user_id=? AND slot=?",
+            user_id,
+            slot,
+        )
+
+    async def load_journal(
+        self, guild: discord.Guild, user_id: int, media_type: str = "all"
+    ) -> list[tuple[MediaHit, Any]]:
+        db = self.data.get(guild)
+        if media_type == "all":
+            rows = await db.fetchall(
+                """SELECT r.*, m.source, m.source_id, m.media_type, m.title, m.subtitle, m.year,
+                          m.poster_url, m.url, m.overview, m.genres, m.extra_json
+                   FROM reviews r JOIN media m ON m.id = r.media_id
+                   WHERE r.user_id=?
+                   ORDER BY r.updated_at DESC""",
+                user_id,
+            )
+        else:
+            rows = await db.fetchall(
+                """SELECT r.*, m.source, m.source_id, m.media_type, m.title, m.subtitle, m.year,
+                          m.poster_url, m.url, m.overview, m.genres, m.extra_json
+                   FROM reviews r JOIN media m ON m.id = r.media_id
+                   WHERE r.user_id=? AND m.media_type=?
+                   ORDER BY r.updated_at DESC""",
+                user_id,
+                media_type,
+            )
+        return [(hit_from_row(row), row) for row in rows]
+
+    async def load_recent(self, guild: discord.Guild, *, limit: int = 40) -> list[tuple[MediaHit, Any]]:
+        rows = await self.data.get(guild).fetchall(
+            """SELECT r.*, m.source, m.source_id, m.media_type, m.title, m.subtitle, m.year,
+                      m.poster_url, m.url, m.overview, m.genres, m.extra_json
+               FROM reviews r JOIN media m ON m.id = r.media_id
+               ORDER BY r.updated_at DESC
+               LIMIT ?""",
+            limit,
+        )
+        return [(hit_from_row(row), row) for row in rows]
+
+    async def load_catalog(
+        self,
+        guild: discord.Guild,
+        *,
+        query: str | None = None,
+        member_id: int | None = None,
+        media_type: str = "all",
+        min_rating: float | None = None,
+    ) -> list[tuple[MediaHit, float, int]]:
+        sql = """SELECT m.*, AVG(r.rating) AS avg_rating, COUNT(r.id) AS n
+                 FROM media m JOIN reviews r ON r.media_id = m.id"""
+        clauses: list[str] = []
+        args: list[Any] = []
+        if member_id:
+            clauses.append("r.user_id=?")
+            args.append(member_id)
+        if media_type != "all":
+            clauses.append("m.media_type=?")
+            args.append(media_type)
+        if min_rating is not None:
+            clauses.append("r.rating>=?")
+            args.append(min_rating)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " GROUP BY m.id"
+        rows = await self.data.get(guild).fetchall(sql, *args)
+        items = [(hit_from_row(row), float(row["avg_rating"]), int(row["n"])) for row in rows]
+        if query:
+            items = fuzzy.finder(
+                query,
+                items,
+                key=lambda item: f"{item[0].title} {item[0].subtitle} {item[0].year or ''}",
+            )
+        return items
+
+    async def load_top(
+        self,
+        guild: discord.Guild,
+        *,
+        media_type: str = "all",
+        period: str = "all",
+    ) -> list[tuple[MediaHit, float, int]]:
+        sql = """SELECT m.*, AVG(r.rating) AS avg_rating, COUNT(r.id) AS n
+                 FROM media m JOIN reviews r ON r.media_id = m.id"""
+        clauses: list[str] = []
+        args: list[Any] = []
+        if media_type != "all":
+            clauses.append("m.media_type=?")
+            args.append(media_type)
+        if period in PERIOD_SECONDS:
+            clauses.append("r.updated_at>=?")
+            args.append(int(time.time()) - PERIOD_SECONDS[period])
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " GROUP BY m.id ORDER BY avg_rating DESC, n DESC LIMIT 25"
+        rows = await self.data.get(guild).fetchall(sql, *args)
+        return [(hit_from_row(row), float(row["avg_rating"]), int(row["n"])) for row in rows]
 
     async def grant_review_xp(
         self,
@@ -1976,110 +2405,15 @@ class Reviews(commands.Cog):
         view = MediaSessionView(self, guild, hits, author_id=interaction.user.id, ephemeral=False)
         await view.start(interaction, deferred=True)
 
-    @critique_group.command(name="journal")
-    @app_commands.rename(member="membre", media_type="type")
-    @app_commands.describe(member="Membre dont afficher le journal (toi par défaut)", media_type="Filtrer par type")
-    @app_commands.choices(media_type=TYPE_CHOICES)
-    async def critique_journal(
-        self,
-        interaction: discord.Interaction,
-        member: discord.Member | None = None,
-        media_type: str = "all",
-    ) -> None:
-        """Journal des notes d'un membre du serveur."""
-        guild = interaction.guild
-        if not isinstance(guild, discord.Guild):
-            return await interaction.response.send_message(
-                "**Erreur ·** Cette commande ne peut être utilisée que sur un serveur.", ephemeral=True
-            )
-        target = member or interaction.user
-        await interaction.response.defer()
-        db = self.data.get(guild)
-        if media_type == "all":
-            rows = await db.fetchall(
-                """SELECT r.*, m.source, m.source_id, m.media_type, m.title, m.subtitle, m.year,
-                          m.poster_url, m.url, m.overview, m.genres, m.extra_json
-                   FROM reviews r JOIN media m ON m.id = r.media_id
-                   WHERE r.user_id=?
-                   ORDER BY r.updated_at DESC""",
-                target.id,
-            )
-        else:
-            rows = await db.fetchall(
-                """SELECT r.*, m.source, m.source_id, m.media_type, m.title, m.subtitle, m.year,
-                          m.poster_url, m.url, m.overview, m.genres, m.extra_json
-                   FROM reviews r JOIN media m ON m.id = r.media_id
-                   WHERE r.user_id=? AND m.media_type=?
-                   ORDER BY r.updated_at DESC""",
-                target.id,
-                media_type,
-            )
-        entries = [(hit_from_row(row), row) for row in rows]
-        average = (sum(float(row["rating"]) for _, row in entries) / len(entries)) if entries else None
-        xp = await self.get_profile_xp(guild, target.id)
-        view = JournalView(
-            self,
-            guild,
-            target,
-            entries,
-            average=average,
-            title=title_for_level(level_for_xp(xp)),
-        )
-        await view.start(interaction, deferred=True)
-
-    @critique_group.command(name="affinite")
-    @app_commands.rename(member="membre")
-    @app_commands.describe(member="Quelqu'un à comparer (sinon tes jumeaux et ton rival)")
-    async def critique_affinite(
-        self,
-        interaction: discord.Interaction,
-        member: discord.Member | None = None,
-    ) -> None:
-        """Compare tes notes avec celles d'un autre membre, ou liste tes affinités."""
-        guild = interaction.guild
-        if not isinstance(guild, discord.Guild):
-            return await interaction.response.send_message(
-                "**Erreur ·** Cette commande ne peut être utilisée que sur un serveur.", ephemeral=True
-            )
-        await interaction.response.defer()
-        if member is None or member.id == interaction.user.id:
-            affinities = await self.list_affinities(guild, interaction.user.id)
-            titles = await self.get_titles(
-                guild,
-                [interaction.user.id, *[item.user_id for item in affinities]],
-            )
-            view = AffinityHubView(self, guild, interaction.user.id, affinities, titles=titles)
-            await view.start(interaction, deferred=True)
-            return
-        affinity = await self.get_affinity(guild, interaction.user.id, member.id)
-        if affinity is None:
-            await interaction.edit_original_response(
-                content=f"**Info ·** Aucune œuvre en commun avec {member.display_name}."
-            )
-            return
-        if affinity.overlap < MIN_AFFINITY_OVERLAP:
-            await interaction.edit_original_response(
-                content=(
-                    f"**Info ·** Seulement {affinity.overlap} œuvre(s) en commun avec {member.display_name} "
-                    f"(minimum {MIN_AFFINITY_OVERLAP} pour un score fiable)."
-                )
-            )
-            return
-        titles = await self.get_titles(guild, [interaction.user.id, member.id])
-        view = AffinityCompareView(
-            self, guild, interaction.user.id, member.id, affinity=affinity, titles=titles
-        )
-        await interaction.edit_original_response(view=view, allowed_mentions=NO_PINGS)
-
     @critique_group.command(name="profil")
     @app_commands.rename(member="membre")
-    @app_commands.describe(member="Membre dont afficher le profil critique")
+    @app_commands.describe(member="Membre dont afficher le profil, le journal et les affinités")
     async def critique_profil(
         self,
         interaction: discord.Interaction,
         member: discord.Member | None = None,
     ) -> None:
-        """Profil critique : titre, XP, jumeau et rival."""
+        """Profil d'un membre : préférées, journal et affinités."""
         guild = interaction.guild
         if not isinstance(guild, discord.Guild):
             return await interaction.response.send_message(
@@ -2089,21 +2423,16 @@ class Reviews(commands.Cog):
         await interaction.response.defer()
         await self.ensure_progress(guild)
         xp = await self.get_profile_xp(guild, target.id)
-        db = self.data.get(guild)
-        stats = await db.fetchone(
-            "SELECT COUNT(*) AS n, AVG(rating) AS avg_rating FROM reviews WHERE user_id=?",
-            target.id,
+        journal_entries = await self.load_journal(guild, target.id)
+        review_count = len(journal_entries)
+        average = (
+            sum(float(row["rating"]) for _hit, row in journal_entries) / review_count
+            if journal_entries else None
         )
-        review_count = int(stats["n"]) if stats else 0
-        average = float(stats["avg_rating"]) if stats and stats["avg_rating"] is not None else None
         affinities = await self.list_affinities(guild, target.id)
         twin = affinities[0] if affinities else None
         rival = min(affinities, key=lambda item: (item.percent, -item.overlap)) if affinities else None
-        title_ids = [target.id]
-        if twin:
-            title_ids.append(twin.user_id)
-        if rival:
-            title_ids.append(rival.user_id)
+        title_ids = [target.id, *[item.user_id for item in affinities]]
         view = ProfileView(
             self,
             guild,
@@ -2114,13 +2443,18 @@ class Reviews(commands.Cog):
             twin=twin,
             rival=rival,
             titles=await self.get_titles(guild, title_ids),
+            favorites=await self.get_favorites(guild, target.id),
+            journal_entries=journal_entries,
+            affinities=affinities,
+            editable=target.id == interaction.user.id,
         )
+        view._interaction = interaction
         await interaction.edit_original_response(view=view, allowed_mentions=NO_PINGS)
 
     @critique_group.command(name="search")
     @app_commands.rename(query="recherche", member="membre", media_type="type", min_rating="note_min")
     @app_commands.describe(
-        query="Rechercher dans le catalogue déjà noté du serveur",
+        query="Filtrer le catalogue déjà noté du serveur",
         member="Limiter aux notes d'un membre",
         media_type="Filtrer par type",
         min_rating="Note minimale (sur l'œuvre ou la critique)",
@@ -2134,49 +2468,23 @@ class Reviews(commands.Cog):
         media_type: str = "all",
         min_rating: float | None = None,
     ) -> None:
-        """Cherche dans la base critique du serveur, ou affiche les dernières notes."""
+        """Explore le serveur : récentes, catalogue et top."""
         guild = interaction.guild
         if not isinstance(guild, discord.Guild):
             return await interaction.response.send_message(
                 "**Erreur ·** Cette commande ne peut être utilisée que sur un serveur.", ephemeral=True
             )
         await interaction.response.defer()
-        db = self.data.get(guild)
-
-        if not query and not member and min_rating is None and media_type == "all":
-            rows = await db.fetchall(
-                """SELECT r.*, m.source, m.source_id, m.media_type, m.title, m.subtitle, m.year,
-                          m.poster_url, m.url, m.overview, m.genres, m.extra_json
-                   FROM reviews r JOIN media m ON m.id = r.media_id
-                   ORDER BY r.updated_at DESC
-                   LIMIT 40"""
-            )
-            entries = [(hit_from_row(row), row) for row in rows]
-            titles = await self.get_titles(guild, [int(row["user_id"]) for _hit, row in entries])
-            view = RecentView(self, guild, entries, titles=titles)
-            await view.start(interaction, deferred=True)
-            return
-
-        sql = """SELECT m.*, AVG(r.rating) AS avg_rating, COUNT(r.id) AS n
-                 FROM media m JOIN reviews r ON r.media_id = m.id"""
-        clauses: list[str] = []
-        args: list[Any] = []
-        if member:
-            clauses.append("r.user_id=?")
-            args.append(member.id)
-        if media_type != "all":
-            clauses.append("m.media_type=?")
-            args.append(media_type)
-        if min_rating is not None:
-            clauses.append("r.rating>=?")
-            args.append(min_rating)
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " GROUP BY m.id"
-        rows = await db.fetchall(sql, *args)
-        items = [(hit_from_row(row), float(row["avg_rating"]), int(row["n"])) for row in rows]
-        if query:
-            items = fuzzy.finder(query, items, key=lambda item: f"{item[0].title} {item[0].subtitle} {item[0].year or ''}")
+        recent = await self.load_recent(guild)
+        catalog = await self.load_catalog(
+            guild,
+            query=query,
+            member_id=member.id if member else None,
+            media_type=media_type,
+            min_rating=min_rating,
+        )
+        top = await self.load_top(guild, media_type=media_type)
+        titles = await self.get_titles(guild, [int(row["user_id"]) for _hit, row in recent])
         subtitle_parts = []
         if query:
             subtitle_parts.append(f"« {pretty.shorten_text(query, 60)} »")
@@ -2186,65 +2494,20 @@ class Reviews(commands.Cog):
             subtitle_parts.append(type_label(media_type))
         if min_rating is not None:
             subtitle_parts.append(f"≥ {min_rating:g}/5")
-        view = CatalogView(
+        filtered = bool(query or member or min_rating is not None or media_type != "all")
+        view = ServerHubView(
             self,
             guild,
-            items,
-            title="Catalogue du serveur",
-            subtitle="  ·  ".join(subtitle_parts) or "Toutes les œuvres notées",
+            recent=recent,
+            catalog=catalog,
+            top=top,
+            titles=titles,
+            catalog_subtitle="  ·  ".join(subtitle_parts) or "Toutes les œuvres notées",
+            media_type=media_type,
+            tab="catalogue" if filtered else "recentes",
         )
-        await view.start(interaction, deferred=True)
-
-    @critique_group.command(name="top")
-    @app_commands.rename(media_type="type", period="periode")
-    @app_commands.describe(media_type="Type de média", period="Fenêtre de temps")
-    @app_commands.choices(
-        media_type=TYPE_CHOICES,
-        period=[
-            app_commands.Choice(name="Tout", value="all"),
-            app_commands.Choice(name="Cette semaine", value="semaine"),
-            app_commands.Choice(name="Ce mois", value="mois"),
-        ],
-    )
-    async def critique_top(
-        self,
-        interaction: discord.Interaction,
-        media_type: str = "all",
-        period: str = "all",
-    ) -> None:
-        """Classement des œuvres les mieux notées du serveur."""
-        guild = interaction.guild
-        if not isinstance(guild, discord.Guild):
-            return await interaction.response.send_message(
-                "**Erreur ·** Cette commande ne peut être utilisée que sur un serveur.", ephemeral=True
-            )
-        await interaction.response.defer()
-        db = self.data.get(guild)
-        sql = """SELECT m.*, AVG(r.rating) AS avg_rating, COUNT(r.id) AS n
-                 FROM media m JOIN reviews r ON r.media_id = m.id"""
-        clauses: list[str] = []
-        args: list[Any] = []
-        if media_type != "all":
-            clauses.append("m.media_type=?")
-            args.append(media_type)
-        if period in PERIOD_SECONDS:
-            clauses.append("r.updated_at>=?")
-            args.append(int(time.time()) - PERIOD_SECONDS[period])
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " GROUP BY m.id ORDER BY avg_rating DESC, n DESC LIMIT 25"
-        rows = await db.fetchall(sql, *args)
-        items = [(hit_from_row(row), float(row["avg_rating"]), int(row["n"])) for row in rows]
-        period_label = {"all": "toutes périodes", "semaine": "cette semaine", "mois": "ce mois"}.get(period, period)
-        type_part = type_label(media_type) if media_type != "all" else "Tous types"
-        view = CatalogView(
-            self,
-            guild,
-            items,
-            title="Top du serveur",
-            subtitle=f"{type_part}  ·  {period_label}",
-        )
-        await view.start(interaction, deferred=True)
+        view._interaction = interaction
+        await interaction.edit_original_response(view=view, allowed_mentions=NO_PINGS)
 
     @app_commands.command(name="critiqueconfig")
     @app_commands.guild_only()

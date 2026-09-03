@@ -151,8 +151,11 @@ class TMDBClient:
 
         try:
             payload = await _json(self.session, endpoint, params=params, timeout=aiohttp.ClientTimeout(total=8))
+        except aiohttp.ClientResponseError as exc:
+            logger.warning("Recherche TMDB échouée : HTTP %s (%s) %s", exc.status, endpoint, exc.message)
+            return []
         except Exception as exc:
-            logger.warning("Recherche TMDB échouée : %s", exc)
+            logger.warning("Recherche TMDB échouée (%s) : %s", endpoint, exc)
             return []
 
         raw_results = payload.get("results") or []
@@ -514,6 +517,16 @@ class OpenLibraryClient:
         return hits
 
 
+_TYPE_PRIORITY = {
+    "movie": 0,
+    "tv": 1,
+    "game": 2,
+    "album": 3,
+    "book": 4,
+    "track": 5,
+}
+
+
 class MediaCatalog:
     """Orchestre les fournisseurs et fusionne les résultats multi-sources."""
 
@@ -525,9 +538,9 @@ class MediaCatalog:
         spotify_id: str,
         spotify_secret: str,
     ):
-        self.tmdb = TMDBClient(session, tmdb_key)
+        self.tmdb = TMDBClient(session, tmdb_key.strip())
         self.steam = SteamClient(session)
-        self.spotify = SpotifyClient(session, spotify_id, spotify_secret)
+        self.spotify = SpotifyClient(session, spotify_id.strip(), spotify_secret.strip())
         self.books = OpenLibraryClient(session)
 
     def status(self) -> dict[str, bool]:
@@ -543,9 +556,13 @@ class MediaCatalog:
         per = 4 if wide else 8
         clean, _year = parse_query_year(query)
         tasks: list[Any] = []
-        if media_type in ("all", "movie", "tv"):
-            tmdb_type = None if wide else media_type
-            tasks.append(self.tmdb.search(query, tmdb_type, 6 if wide else 8))
+        # Film + série en parallèle : /search/multi ignore trop souvent les films
+        # et, en cas d'échec silencieux, Spotify se retrouvait en tête.
+        if media_type == "all":
+            tasks.append(self.tmdb.search(query, "movie", 8))
+            tasks.append(self.tmdb.search(query, "tv", 6))
+        elif media_type in ("movie", "tv"):
+            tasks.append(self.tmdb.search(query, media_type, 8))
         if media_type in ("all", "game"):
             tasks.append(self.steam.search(clean, per))
         if media_type in ("all", "album"):
@@ -567,6 +584,24 @@ class MediaCatalog:
                     continue
                 seen.add(hit.identity)
                 merged.append(hit)
+
+        q = clean.casefold()
+
+        def rank(hit: MediaHit) -> tuple[int, int, int, int]:
+            title = hit.title.casefold()
+            return (
+                -_TYPE_PRIORITY.get(hit.media_type, 9),
+                int(title == q),
+                int(title.startswith(q)),
+                int(q in title),
+            )
+
+        merged.sort(key=rank, reverse=True)
+        if wide and not any(hit.source == "tmdb" for hit in merged):
+            if not self.tmdb.available:
+                logger.warning("Recherche « tous types » sans TMDB : clé absente")
+            else:
+                logger.warning("Recherche « tous types » : TMDB n'a rien renvoyé pour %r", query)
         return merged[:25]
 
     async def enrich(self, hit: MediaHit) -> MediaHit:
