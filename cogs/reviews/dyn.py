@@ -160,6 +160,14 @@ def bind_record(wid: str, channel_id: int, message_id: int) -> None:
         )
 
 
+def update_payload(wid: str, payload: dict[str, Any]) -> None:
+    with _db() as conn:
+        conn.execute(
+            "UPDATE fiches SET payload = ? WHERE id = ?",
+            (json.dumps(payload, ensure_ascii=False), wid),
+        )
+
+
 def mark_stripped(wid: str) -> None:
     with _db() as conn:
         conn.execute("UPDATE fiches SET stripped = 1 WHERE id = ?", (wid,))

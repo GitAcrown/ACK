@@ -23,6 +23,7 @@ from .dyn import (
     is_live,
     mark_stripped,
     sweep_expired,
+    update_payload,
 )
 from .emojis import BOOK, EXPLICIT, GAME, MUSIC, RIVAL, SALE, STAR, STAR_EMPTY, STAR_HALF, TWIN, TV, XP
 from .progress import (
@@ -428,9 +429,7 @@ def render_published_fiche(
         body.append(discord.ui.ActionRow(
             FicheDynButton(wid, "fiche", label="Fiche", style=discord.ButtonStyle.primary),
             FicheDynButton(wid, "critiques", label=f"Critiques ({count})"),
-        ))
-        body.append(discord.ui.ActionRow(
-            FicheDynButton(wid, "noter", label="Noter", style=discord.ButtonStyle.green),
+            FicheDynButton(wid, "noter", label="Ma note", style=discord.ButtonStyle.green),
         ))
     view.add_item(discord.ui.Container(*body))
     return view
@@ -483,6 +482,33 @@ async def send_published_fiche(
     bind_record(wid, message.channel.id, message.id)
 
 
+async def sync_published_fiche(cog: "Reviews", guild: discord.Guild, wid: str, hit: MediaHit) -> None:
+    rec = get_record(wid)
+    if not is_live(rec) or rec is None:
+        return
+    media_id = await cog.lookup_media_id(guild, hit)
+    avg, count = await cog.media_stats(guild, media_id) if media_id else (None, 0)
+    reviews = await cog.list_reviews(guild, media_id) if media_id else []
+    social = cog.social_line_for_reviews(guild, reviews, viewer_id=None)
+    rec.payload.update({"hit": hit_to_dict(hit), "avg": avg, "count": count, "social": social})
+    update_payload(wid, rec.payload)
+    view = render_published_fiche(hit, avg=avg, count=count, social=social, wid=wid, live=True)
+    if not rec.channel_id or not rec.message_id:
+        return
+    try:
+        channel = cog.bot.get_channel(rec.channel_id) or await cog.bot.fetch_channel(rec.channel_id)
+        message = await channel.fetch_message(rec.message_id)
+        await message.edit(view=view)
+    except Exception as exc:
+        logger.info("Maj fiche publiée %s : %s", wid, exc)
+
+
+async def send_ephemeral_menu(interaction: discord.Interaction, view: ReviewsLayout) -> None:
+    """Nouveau message éphémère — ne jamais éditer la fiche publique."""
+    await interaction.response.send_message(view=view, ephemeral=True)
+    view._interaction = interaction
+
+
 async def handle_published_fiche_click(
     interaction: discord.Interaction,
     wid: str,
@@ -511,25 +537,13 @@ async def handle_published_fiche_click(
         )
         return
     hit = hit_from_dict(raw)
-    session = MediaSessionView(cog, guild, [hit], author_id=interaction.user.id, ephemeral=True)
     if action == "noter":
-        await session.reload_stats()
-        session._build()
-        existing = session.my_review or {}
-        await interaction.response.send_modal(
-            RateModal(
-                session,
-                max_comment=await cog.get_comment_max(guild),
-                default_rating=existing.get("rating"),
-                default_comment=existing.get("comment") or "",
-            )
-        )
-        return
-    await interaction.response.defer(ephemeral=True)
-    session.tab = "critiques" if action == "critiques" else "fiche"
-    await session.prepare()
-    await interaction.edit_original_response(view=session)
-    session._interaction = interaction
+        menu = await MyNoteView.create(cog, guild, hit, interaction.user.id, published_wid=wid)
+    elif action == "critiques":
+        menu = await PublicCritiquesView.create(cog, guild, hit, interaction.user.id)
+    else:
+        menu = await PublicFichePeekView.create(cog, guild, hit)
+    await send_ephemeral_menu(interaction, menu)
 
 
 async def open_public_fiche(
@@ -572,8 +586,24 @@ def build_announce_view(
 # Modal de notation
 # ---------------------------------------------------------------------------
 
+def _review_saved_lines(hit: MediaHit, rating: float, created: bool, award: XpAward) -> list[str]:
+    verb = "enregistrée" if created else "mise à jour"
+    parts = [f"**Critique {verb} ·** {format_stars(rating)}  **{rating:g}/5** — {hit.title}."]
+    if award.gained:
+        parts.append(f"{XP} +{award.gained} · niveau {award.level}")
+        if award.capped:
+            parts.append("(plafond quotidien atteint)")
+    elif award.capped:
+        parts.append("Plafond d'XP quotidien atteint.")
+    if award.leveled_up:
+        new_title = title_for_level(award.level)
+        old_title = title_for_level(award.previous_level)
+        parts.append(f"Nouveau titre · {new_title}" if new_title != old_title else f"Niveau {award.level}")
+    return parts
+
+
 class RateModal(discord.ui.Modal, title="Noter cette œuvre"):
-    def __init__(self, parent: "MediaSessionView", *, max_comment: int, default_rating: float | None, default_comment: str):
+    def __init__(self, parent: Any, *, max_comment: int, default_rating: float | None, default_comment: str):
         super().__init__()
         self._hub = parent
         self.rating_input = discord.ui.TextInput(
@@ -602,11 +632,267 @@ class RateModal(discord.ui.Modal, title="Noter cette œuvre"):
                 ephemeral=True,
             )
             return
-        orphan = self._hub._interaction is None and self._hub._message is None
-        await interaction.response.defer(ephemeral=orphan)
-        if orphan:
+        from_public = bool(self._hub.from_published_modal)
+        orphan = from_public or (self._hub._interaction is None and self._hub._message is None)
+        await interaction.response.defer(ephemeral=orphan or from_public)
+        if orphan and not from_public:
             self._hub._interaction = interaction
         await self._hub.save_review(interaction, rating, str(self.comment_input.value or "").strip())
+
+
+class MyNoteEditButton(discord.ui.Button):
+    def __init__(self, parent: "MyNoteView"):
+        super().__init__(
+            label="Modifier" if parent.my_review else "Ajouter une note",
+            style=discord.ButtonStyle.secondary if parent.my_review else discord.ButtonStyle.green,
+        )
+        self._hub = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        existing = self._hub.my_review or {}
+        await interaction.response.send_modal(
+            RateModal(
+                self._hub,
+                max_comment=await self._hub.cog.get_comment_max(self._hub.guild),
+                default_rating=existing.get("rating"),
+                default_comment=existing.get("comment") or "",
+            )
+        )
+
+
+class MyNoteDeleteButton(discord.ui.Button):
+    def __init__(self, parent: "MyNoteView"):
+        super().__init__(label="Supprimer", style=discord.ButtonStyle.red)
+        self._hub = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        await self._hub.delete_review(interaction)
+
+
+class MyNoteView(ReviewsLayout):
+    """Menu éphémère : uniquement la note du clicqueur."""
+
+    def __init__(
+        self,
+        cog: "Reviews",
+        guild: discord.Guild,
+        hit: MediaHit,
+        *,
+        author_id: int,
+        my_review: dict | None,
+        published_wid: str | None,
+    ):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild = guild
+        self.hit = hit
+        self.author_id = author_id
+        self.my_review = my_review
+        self.published_wid = published_wid
+        self.from_published_modal = False
+        self._interaction: discord.Interaction | None = None
+        self._message: discord.WebhookMessage | discord.Message | None = None
+        self._build()
+
+    @classmethod
+    async def create(
+        cls,
+        cog: "Reviews",
+        guild: discord.Guild,
+        hit: MediaHit,
+        author_id: int,
+        *,
+        published_wid: str | None,
+    ) -> "MyNoteView":
+        media_id = await cog.lookup_media_id(guild, hit)
+        mine = await cog.get_review(guild, author_id, media_id) if media_id else None
+        return cls(cog, guild, hit, author_id=author_id, my_review=mine, published_wid=published_wid)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "**Action impossible ·** Ce menu ne concerne que ta note.",
+                ephemeral=True,
+                delete_after=10,
+            )
+            return False
+        return True
+
+    def _build(self) -> None:
+        hit = self.hit
+        mine = self.my_review
+        if mine:
+            text = (
+                f"{_title_line(hit)}\n"
+                f"{format_stars(mine['rating'])}  **{mine['rating']:g}/5**\n"
+            )
+            if mine.get("comment"):
+                text += f"*{pretty.shorten_text(mine['comment'], 240)}*\n"
+            text += f"-# Ta note · {_meta_line(hit)}"
+        else:
+            text = (
+                f"{_title_line(hit)}\n"
+                f"*Tu n'as pas encore noté cette œuvre.*\n"
+                f"-# {_meta_line(hit)}"
+            )
+        actions: list[discord.ui.Item] = [MyNoteEditButton(self)]
+        if mine:
+            actions.append(MyNoteDeleteButton(self))
+        self.set_layout([section_with_thumbnail(text, hit.poster_url)], discord.ui.ActionRow(*actions))
+
+    async def save_review(self, interaction: discord.Interaction, rating: float, comment: str) -> None:
+        created, award = await self.cog.upsert_review(self.guild, interaction.user, self.hit, rating, comment)
+        media_id = await self.cog.lookup_media_id(self.guild, self.hit)
+        self.my_review = await self.cog.get_review(self.guild, self.author_id, media_id) if media_id else None
+        self._build()
+        if self.published_wid:
+            await sync_published_fiche(self.cog, self.guild, self.published_wid, self.hit)
+        await apply_view(interaction, self)
+        await interaction.followup.send("\n".join(_review_saved_lines(self.hit, rating, created, award)), ephemeral=True)
+        await self.cog.announce_review(self.guild, interaction.user, self.hit, rating, comment, updated=not created)
+
+    async def delete_review(self, interaction: discord.Interaction) -> None:
+        await self.cog.delete_review(self.guild, self.author_id, self.hit)
+        self.my_review = None
+        self._build()
+        if self.published_wid:
+            await sync_published_fiche(self.cog, self.guild, self.published_wid, self.hit)
+        await apply_view(interaction, self)
+        await interaction.followup.send("**Critique supprimée ·** Ta note a été retirée.", ephemeral=True)
+
+
+class PublicFichePeekView(ReviewsLayout):
+    """Menu éphémère lecture seule — ouvert depuis le bouton Fiche public."""
+
+    def __init__(self, hit: MediaHit, *, avg: float | None, count: int, social: str):
+        super().__init__(timeout=300)
+        self._interaction: discord.Interaction | None = None
+        body: list[discord.ui.Item] = []
+        body.extend(fiche_intro(hit))
+        body.append(section_with_thumbnail(
+            _fiche_body(hit, avg=avg, count=count, my_review=None, social_line=social),
+            hit.poster_url,
+        ))
+        footer = _footer_line(hit)
+        if footer:
+            body.append(discord.ui.Separator())
+            body.append(discord.ui.TextDisplay(f"-# {footer}"))
+        self.set_layout(body)
+
+    @classmethod
+    async def create(cls, cog: "Reviews", guild: discord.Guild, hit: MediaHit) -> "PublicFichePeekView":
+        media_id = await cog.lookup_media_id(guild, hit)
+        avg, count = await cog.media_stats(guild, media_id) if media_id else (None, 0)
+        reviews = await cog.list_reviews(guild, media_id) if media_id else []
+        social = cog.social_line_for_reviews(guild, reviews, viewer_id=None)
+        return cls(hit, avg=avg, count=count, social=social)
+
+
+class PublicCritiquesPageButton(discord.ui.Button):
+    def __init__(self, parent: "PublicCritiquesView", delta: int, label: str):
+        super().__init__(label=label, style=discord.ButtonStyle.secondary)
+        self._hub = parent
+        self._delta = delta
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self._hub.page = max(0, self._hub.page + self._delta)
+        self._hub._build()
+        await apply_view(interaction, self._hub)
+
+
+class PublicCritiquesView(ReviewsLayout):
+    """Menu éphémère lecture seule — ouvert depuis le bouton Critiques public."""
+
+    def __init__(
+        self,
+        cog: "Reviews",
+        guild: discord.Guild,
+        hit: MediaHit,
+        *,
+        author_id: int,
+        reviews: list[Any],
+        titles: dict[int, str],
+        avg: float | None,
+        count: int,
+    ):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild = guild
+        self.hit = hit
+        self.author_id = author_id
+        self.reviews = reviews
+        self.titles = titles
+        self.avg = avg
+        self.count = count
+        self.page = 0
+        self._interaction: discord.Interaction | None = None
+        self._build()
+
+    @classmethod
+    async def create(
+        cls,
+        cog: "Reviews",
+        guild: discord.Guild,
+        hit: MediaHit,
+        author_id: int,
+    ) -> "PublicCritiquesView":
+        media_id = await cog.lookup_media_id(guild, hit)
+        avg, count = await cog.media_stats(guild, media_id) if media_id else (None, 0)
+        reviews = await cog.list_reviews(guild, media_id) if media_id else []
+        titles = await cog.get_titles(guild, [int(row["user_id"]) for row in reviews])
+        return cls(cog, guild, hit, author_id=author_id, reviews=reviews, titles=titles, avg=avg, count=count)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "**Action impossible ·** Ce menu ne s'affiche que pour toi.",
+                ephemeral=True,
+                delete_after=10,
+            )
+            return False
+        return True
+
+    def _build(self) -> None:
+        hit = self.hit
+        body: list[discord.ui.Item] = list(fiche_intro(hit)[:2])
+        rows: list[discord.ui.ActionRow] = []
+        if not self.reviews:
+            empty = "*Pas encore de critique sur ce serveur.*"
+            if hit.url:
+                empty += f"\n-# [{_link_label(hit)}]({hit.url})"
+            body.append(discord.ui.TextDisplay(empty))
+            self.set_layout(body)
+            return
+        max_page = max(0, (len(self.reviews) - 1) // REVIEWS_PAGE)
+        self.page = min(self.page, max_page)
+        start = self.page * REVIEWS_PAGE
+        for row in self.reviews[start:start + REVIEWS_PAGE]:
+            user_id = int(row["user_id"])
+            _name, avatar = _user_display(self.guild, self.cog.bot, user_id)
+            title = self.titles.get(user_id, title_for_level(1))
+            text = (
+                f"{_titled(_mention(self.guild, self.cog.bot, user_id), title)}\n"
+                f"{format_stars(row['rating'])}  **{row['rating']:g}/5** · <t:{row['updated_at']}:R>"
+            )
+            if row["comment"]:
+                text += f"\n{pretty.shorten_text(row['comment'], 220)}"
+            body.append(section_with_thumbnail(text, avatar))
+        total_pages = max(1, (len(self.reviews) + REVIEWS_PAGE - 1) // REVIEWS_PAGE)
+        page_note = (
+            f"-# {self.count} critique(s) · moyenne {format_stars(self.avg or 0)} "
+            f"{(self.avg or 0):.1f}/5 · page {self.page + 1}/{total_pages}"
+        )
+        if hit.url:
+            page_note += f"  ·  [{_link_label(hit)}]({hit.url})"
+        body.append(discord.ui.TextDisplay(page_note))
+        if max_page > 0:
+            prev_btn = PublicCritiquesPageButton(self, -1, "← Précédent")
+            next_btn = PublicCritiquesPageButton(self, 1, "Suivant →")
+            prev_btn.disabled = self.page <= 0
+            next_btn.disabled = self.page >= max_page
+            rows.append(discord.ui.ActionRow(prev_btn, next_btn))
+        self.set_layout(body, *rows)
 
 
 # ---------------------------------------------------------------------------
@@ -688,6 +974,8 @@ class DeleteReviewButton(discord.ui.Button):
         await self._hub.cog.delete_review(self._hub.guild, interaction.user.id, self._hub.hit)
         self._hub.my_review = None
         await self._hub.reload_stats()
+        if self._hub.published_wid:
+            await sync_published_fiche(self._hub.cog, self._hub.guild, self._hub.published_wid, self._hub.hit)
         await self._hub.refresh(interaction)
         await interaction.followup.send("**Critique supprimée ·** Ta note a été retirée.", ephemeral=True)
 
@@ -772,6 +1060,8 @@ class MediaSessionView(ReviewsLayout):
         self.titles: dict[int, str] = {}
         self._interaction: discord.Interaction | None = None
         self._message: discord.WebhookMessage | discord.Message | None = None
+        self.published_wid: str | None = None
+        self.from_published_modal = False
 
     @property
     def hit(self) -> MediaHit:
@@ -819,23 +1109,11 @@ class MediaSessionView(ReviewsLayout):
         await self.reload_stats()
         self.pending_rating = None
         self.tab = "fiche"
-        await self.refresh(interaction)
-        verb = "enregistrée" if created else "mise à jour"
-        parts = [f"**Critique {verb} ·** {format_stars(rating)}  **{rating:g}/5** — {self.hit.title}."]
-        if award.gained:
-            parts.append(f"{XP} +{award.gained} · niveau {award.level}")
-            if award.capped:
-                parts.append("(plafond quotidien atteint)")
-        elif award.capped:
-            parts.append("Plafond d'XP quotidien atteint.")
-        if award.leveled_up:
-            new_title = title_for_level(award.level)
-            old_title = title_for_level(award.previous_level)
-            if new_title != old_title:
-                parts.append(f"Nouveau titre · {new_title}")
-            else:
-                parts.append(f"Niveau {award.level}")
-        await interaction.followup.send("\n".join(parts), ephemeral=True)
+        if self.published_wid:
+            await sync_published_fiche(self.cog, self.guild, self.published_wid, self.hit)
+        if not self.from_published_modal:
+            await self.refresh(interaction)
+        await interaction.followup.send("\n".join(_review_saved_lines(self.hit, rating, created, award)), ephemeral=True)
         await self.cog.announce_review(self.guild, interaction.user, self.hit, rating, comment, updated=not created)
 
     def _build(self) -> None:
@@ -854,7 +1132,8 @@ class MediaSessionView(ReviewsLayout):
                     body.append(discord.ui.TextDisplay(
                         "-# Aucun film ou série trouvé — précise le type si besoin."
                     ))
-            rows.append(discord.ui.ActionRow(MediaSelect(self, self.hits, self.selected)))
+            body.append(discord.ui.ActionRow(MediaSelect(self, self.hits, self.selected)))
+            body.append(discord.ui.Separator())
 
         if self.tab == "fiche":
             body.extend(fiche_intro(hit))
@@ -863,7 +1142,7 @@ class MediaSessionView(ReviewsLayout):
                     hit,
                     avg=self.avg,
                     count=self.count,
-                    my_review=self.my_review if self.ephemeral else None,
+                    my_review=self.my_review if self.ephemeral and not self.published_wid else None,
                     social_line=self.social_line,
                 ),
                 hit.poster_url,
@@ -902,24 +1181,24 @@ class MediaSessionView(ReviewsLayout):
                     page_note += f"  ·  [{_link_label(hit)}]({hit.url})"
                 body.append(discord.ui.TextDisplay(page_note))
 
-        rate_label = "Noter"
-        if self.ephemeral and self.pending_rating is not None and self.my_review is None:
-            rate_label = f"Noter {format_stars_compact(self.pending_rating)}"
-        elif self.ephemeral and self.my_review:
-            rate_label = "Modifier ma note"
-        rate_btn = RateButton(self)
-        rate_btn.label = rate_label
-        actions: list[discord.ui.Item] = [rate_btn]
-        if self.ephemeral and self.my_review:
-            actions.append(DeleteReviewButton(self))
-        if self.ephemeral:
-            actions.append(PublishFicheButton(self))
-
         rows.append(discord.ui.ActionRow(
             TabButton(self, "fiche", "Fiche"),
             TabButton(self, "critiques", f"Critiques ({self.count})"),
         ))
-        rows.append(discord.ui.ActionRow(*actions))
+        if not self.published_wid:
+            rate_label = "Noter"
+            if self.ephemeral and self.pending_rating is not None and self.my_review is None:
+                rate_label = f"Noter {format_stars_compact(self.pending_rating)}"
+            elif self.ephemeral and self.my_review:
+                rate_label = "Modifier ma note"
+            rate_btn = RateButton(self)
+            rate_btn.label = rate_label
+            actions: list[discord.ui.Item] = [rate_btn]
+            if self.ephemeral and self.my_review:
+                actions.append(DeleteReviewButton(self))
+            if self.ephemeral:
+                actions.append(PublishFicheButton(self))
+            rows.append(discord.ui.ActionRow(*actions))
         if self.tab == "critiques" and len(self.reviews) > REVIEWS_PAGE:
             nav_btns: list[discord.ui.Item] = []
             if self.review_page > 0:
@@ -2602,14 +2881,18 @@ class Reviews(commands.Cog):
             return await interaction.response.send_message(
                 "**Erreur ·** Cette commande ne peut être utilisée que sur un serveur.", ephemeral=True
             )
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
         hits = await self._search_or_reply(interaction, query, media_type)
         if not hits:
             return
         if len(hits) == 1:
-            await send_published_fiche(self, guild, hits[0], interaction, followup=False)
+            await send_published_fiche(self, guild, hits[0], interaction, followup=True)
+            try:
+                await interaction.delete_original_response()
+            except discord.HTTPException:
+                pass
             return
-        view = MediaSessionView(self, guild, hits, author_id=interaction.user.id, ephemeral=False)
+        view = MediaSessionView(self, guild, hits, author_id=interaction.user.id, ephemeral=True)
         await view.start(interaction, deferred=True)
 
     @critique_group.command(name="profil")
