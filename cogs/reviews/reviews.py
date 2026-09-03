@@ -10,8 +10,20 @@ from typing import Any
 import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
+from .dyn import (
+    FicheDynButton,
+    FicheRecord,
+    bind_record,
+    create_record,
+    get_record,
+    hit_from_dict,
+    hit_to_dict,
+    is_live,
+    mark_stripped,
+    sweep_expired,
+)
 from .emojis import BOOK, EXPLICIT, GAME, MUSIC, RIVAL, SALE, STAR, STAR_EMPTY, STAR_HALF, TWIN, TV, XP
 from .progress import (
     Affinity,
@@ -381,16 +393,148 @@ def _link_label(hit: MediaHit) -> str:
     }.get(hit.source, "Fiche")
 
 
+def render_published_fiche(
+    hit: MediaHit,
+    *,
+    avg: float | None,
+    count: int,
+    social: str,
+    wid: str,
+    live: bool,
+) -> discord.ui.LayoutView:
+    view = discord.ui.LayoutView(timeout=None)
+    body: list[discord.ui.Item] = []
+    body.extend(fiche_intro(hit))
+    body.append(section_with_thumbnail(
+        _fiche_body(hit, avg=avg, count=count, my_review=None, social_line=social),
+        hit.poster_url,
+    ))
+    footer = _footer_line(hit)
+    if footer:
+        body.append(discord.ui.Separator())
+        body.append(discord.ui.TextDisplay(f"-# {footer}"))
+    if live:
+        body.append(discord.ui.ActionRow(
+            FicheDynButton(wid, "fiche", label="Fiche", style=discord.ButtonStyle.primary),
+            FicheDynButton(wid, "critiques", label=f"Critiques ({count})"),
+        ))
+        actions: list[discord.ui.Item] = [
+            FicheDynButton(wid, "noter", label="Noter", style=discord.ButtonStyle.green),
+        ]
+        if hit.url:
+            actions.append(discord.ui.Button(label=_link_label(hit), url=hit.url, style=discord.ButtonStyle.link))
+        body.append(discord.ui.ActionRow(*actions))
+    elif hit.url:
+        body.append(discord.ui.ActionRow(
+            discord.ui.Button(label=_link_label(hit), url=hit.url, style=discord.ButtonStyle.link)
+        ))
+    view.add_item(discord.ui.Container(*body))
+    return view
+
+
+def render_published_record(rec: FicheRecord, *, live: bool) -> discord.ui.LayoutView | None:
+    raw = rec.payload.get("hit")
+    if not isinstance(raw, dict):
+        return None
+    return render_published_fiche(
+        hit_from_dict(raw),
+        avg=rec.payload.get("avg"),
+        count=int(rec.payload.get("count") or 0),
+        social=str(rec.payload.get("social") or ""),
+        wid=rec.id,
+        live=live,
+    )
+
+
+async def send_published_fiche(
+    cog: "Reviews",
+    guild: discord.Guild,
+    hit: MediaHit,
+    interaction: discord.Interaction,
+    *,
+    followup: bool = True,
+) -> None:
+    if cog.catalog is not None:
+        try:
+            hit = await cog.catalog.enrich(hit)
+        except Exception:
+            logger.exception("Enrichissement de fiche publiée impossible")
+    media_id = await cog.lookup_media_id(guild, hit)
+    avg, count = await cog.media_stats(guild, media_id) if media_id else (None, 0)
+    reviews = await cog.list_reviews(guild, media_id) if media_id else []
+    social = cog.social_line_for_reviews(guild, reviews, viewer_id=None)
+    wid = create_record({
+        "guild_id": guild.id,
+        "hit": hit_to_dict(hit),
+        "avg": avg,
+        "count": count,
+        "social": social,
+    })
+    view = render_published_fiche(hit, avg=avg, count=count, social=social, wid=wid, live=True)
+    if followup:
+        message = await interaction.followup.send(view=view)
+    else:
+        await interaction.edit_original_response(view=view)
+        message = await interaction.original_response()
+    bind_record(wid, message.channel.id, message.id)
+
+
+async def handle_published_fiche_click(
+    interaction: discord.Interaction,
+    wid: str,
+    action: str,
+) -> None:
+    rec = get_record(wid)
+    if not is_live(rec):
+        if rec is not None:
+            view = render_published_record(rec, live=False)
+            if view is not None:
+                try:
+                    await interaction.response.edit_message(view=view)
+                except discord.HTTPException:
+                    pass
+            mark_stripped(rec.id)
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Les boutons ont expiré.", ephemeral=True)
+        return
+    cog = interaction.client.get_cog("Reviews")
+    guild = interaction.guild
+    raw = rec.payload.get("hit") if rec else None
+    if cog is None or not isinstance(guild, discord.Guild) or not isinstance(raw, dict):
+        await interaction.response.send_message(
+            "**Erreur ·** Impossible d'ouvrir ce menu.",
+            ephemeral=True,
+        )
+        return
+    hit = hit_from_dict(raw)
+    session = MediaSessionView(cog, guild, [hit], author_id=interaction.user.id, ephemeral=True)
+    if action == "noter":
+        await session.reload_stats()
+        session._build()
+        existing = session.my_review or {}
+        await interaction.response.send_modal(
+            RateModal(
+                session,
+                max_comment=await cog.get_comment_max(guild),
+                default_rating=existing.get("rating"),
+                default_comment=existing.get("comment") or "",
+            )
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    session.tab = "critiques" if action == "critiques" else "fiche"
+    await session.prepare()
+    await interaction.edit_original_response(view=session)
+    session._interaction = interaction
+
+
 async def open_public_fiche(
     cog: "Reviews",
     guild: discord.Guild,
     interaction: discord.Interaction,
     hit: MediaHit,
 ) -> None:
-    view = MediaSessionView(cog, guild, [hit], author_id=interaction.user.id, ephemeral=False)
-    await view.prepare()
-    view._interaction = interaction
-    view._message = await interaction.followup.send(view=view)
+    await send_published_fiche(cog, guild, hit, interaction, followup=True)
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +598,10 @@ class RateModal(discord.ui.Modal, title="Noter cette œuvre"):
                 ephemeral=True,
             )
             return
-        await interaction.response.defer()
+        orphan = self._hub._interaction is None and self._hub._message is None
+        await interaction.response.defer(ephemeral=orphan)
+        if orphan:
+            self._hub._interaction = interaction
         await self._hub.save_review(interaction, rating, str(self.comment_input.value or "").strip())
 
 
@@ -548,16 +695,13 @@ class PublishFicheButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
-        view = MediaSessionView(
+        await send_published_fiche(
             self._hub.cog,
             self._hub.guild,
-            [self._hub.hit],
-            author_id=interaction.user.id,
-            ephemeral=False,
+            self._hub.hit,
+            interaction,
+            followup=True,
         )
-        await view.prepare()
-        view._interaction = interaction
-        view._message = await interaction.followup.send(view=view)
 
 
 class HubTabButton(discord.ui.Button):
@@ -1030,6 +1174,12 @@ class FavoriteSearchModal(discord.ui.Modal):
         self.add_item(self.query_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self._profile.member.id:
+            await interaction.response.send_message(
+                "**Action impossible ·** Seul le propriétaire du profil peut modifier ses préférées.",
+                ephemeral=True,
+            )
+            return
         await interaction.response.defer(ephemeral=True)
         catalog = self._profile.cog.catalog
         if catalog is None:
@@ -1100,6 +1250,16 @@ class FavoritePickView(ReviewsLayout):
             discord.ui.ActionRow(FavoriteHitSelect(self, hits)),
         )
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.profile.member.id:
+            await interaction.response.send_message(
+                "**Action impossible ·** Seul le propriétaire du profil peut modifier ses préférées.",
+                ephemeral=True,
+                delete_after=10,
+            )
+            return False
+        return True
+
 
 class ProfileView(ReviewsLayout):
     def __init__(
@@ -1117,7 +1277,7 @@ class ProfileView(ReviewsLayout):
         favorites: list[tuple[MediaHit, float | None] | None],
         journal_entries: list[tuple[MediaHit, Any]],
         affinities: list[Affinity],
-        editable: bool,
+        viewer_id: int,
         tab: str = "profil",
     ):
         super().__init__(timeout=300)
@@ -1133,11 +1293,22 @@ class ProfileView(ReviewsLayout):
         self.favorites = favorites
         self.journal_entries = journal_entries
         self.affinities = sorted(affinities, key=lambda a: (-a.percent, -a.overlap))
-        self.editable = editable
+        self.viewer_id = viewer_id
+        self.editable = viewer_id == member.id
         self.tab = tab
         self.journal_page = 0
         self._interaction: discord.Interaction | None = None
         self._build()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.viewer_id:
+            await interaction.response.send_message(
+                "**Action impossible ·** Ce profil ne s'affiche que pour toi.",
+                ephemeral=True,
+                delete_after=10,
+            )
+            return False
+        return True
 
     def _name(self, user_id: int) -> str:
         name, _avatar = _user_display(self.guild, self.cog.bot, user_id)
@@ -1293,6 +1464,8 @@ class ProfileView(ReviewsLayout):
         self.set_layout(body, *rows, self._tabs_row())
 
     async def apply_favorite(self, slot: int, hit: MediaHit) -> None:
+        if not self.editable:
+            return
         if self.cog.catalog is not None:
             try:
                 hit = await self.cog.catalog.enrich(hit)
@@ -1766,12 +1939,27 @@ class Reviews(commands.Cog):
         missing = [name for name, ok in status.items() if not ok]
         if missing:
             logger.warning("Fournisseurs incomplets : %s", ", ".join(missing))
+        self.bot.add_dynamic_items(FicheDynButton)
+        self._sweep_fiches.start()
 
     async def cog_unload(self) -> None:
+        self._sweep_fiches.cancel()
+        self.bot.remove_dynamic_items(FicheDynButton)
         if self._http is not None:
             await self._http.close()
             self._http = None
         await self.data.close_all()
+
+    @tasks.loop(seconds=30)
+    async def _sweep_fiches(self) -> None:
+        try:
+            await sweep_expired(self.bot, render_published_record)
+        except Exception:
+            logger.exception("sweep fiches publiées")
+
+    @_sweep_fiches.before_loop
+    async def _before_sweep_fiches(self) -> None:
+        await self.bot.wait_until_ready()
 
     # ------------------------------------------------------------------
     # Paramètres
@@ -2401,6 +2589,9 @@ class Reviews(commands.Cog):
         hits = await self._search_or_reply(interaction, query, media_type)
         if not hits:
             return
+        if len(hits) == 1:
+            await send_published_fiche(self, guild, hits[0], interaction, followup=False)
+            return
         view = MediaSessionView(self, guild, hits, author_id=interaction.user.id, ephemeral=False)
         await view.start(interaction, deferred=True)
 
@@ -2419,7 +2610,7 @@ class Reviews(commands.Cog):
                 "**Erreur ·** Cette commande ne peut être utilisée que sur un serveur.", ephemeral=True
             )
         target = member or interaction.user
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
         await self.ensure_progress(guild)
         xp = await self.get_profile_xp(guild, target.id)
         journal_entries = await self.load_journal(guild, target.id)
@@ -2445,7 +2636,7 @@ class Reviews(commands.Cog):
             favorites=await self.get_favorites(guild, target.id),
             journal_entries=journal_entries,
             affinities=affinities,
-            editable=target.id == interaction.user.id,
+            viewer_id=interaction.user.id,
         )
         view._interaction = interaction
         await interaction.edit_original_response(view=view)
