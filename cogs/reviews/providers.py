@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import logging
 import re
 import time
@@ -247,7 +248,82 @@ def _best_spotify_image(images: list[dict]) -> str | None:
     return images[0].get("url")
 
 
-async def _json(session: aiohttp.ClientSession, url: str, **kwargs: Any) -> Any:
+_CACHE_TTL = 15 * 60
+_CACHE_MAX = 512
+
+
+class _ResponseCache:
+    """TTL + coalescence : plusieurs membres sur la même œuvre = une requête HTTP."""
+
+    def __init__(self, ttl: float = _CACHE_TTL, maxsize: int = _CACHE_MAX):
+        self.ttl = ttl
+        self.maxsize = maxsize
+        self._store: dict[str, tuple[float, Any]] = {}
+        self._inflight: dict[str, asyncio.Future] = {}
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _key(url: str, params: Any) -> str:
+        if not params:
+            return url
+        parts = [
+            f"{key}={value}"
+            for key, value in sorted(params.items())
+            if key != "api_key"
+        ]
+        return f"{url}|{'&'.join(parts)}" if parts else url
+
+    def _evict(self) -> None:
+        now = time.monotonic()
+        expired = [key for key, (expires, _) in self._store.items() if expires <= now]
+        for key in expired:
+            del self._store[key]
+        while len(self._store) > self.maxsize:
+            oldest = min(self._store, key=lambda key: self._store[key][0])
+            del self._store[oldest]
+
+    async def get_json(self, session: aiohttp.ClientSession, url: str, **kwargs: Any) -> Any:
+        key = self._key(url, kwargs.get("params"))
+        now = time.monotonic()
+        cached = self._store.get(key)
+        if cached and cached[0] > now:
+            return copy.deepcopy(cached[1])
+
+        owner = False
+        async with self._lock:
+            cached = self._store.get(key)
+            if cached and cached[0] > time.monotonic():
+                return copy.deepcopy(cached[1])
+            waiter = self._inflight.get(key)
+            if waiter is None:
+                waiter = asyncio.get_running_loop().create_future()
+                self._inflight[key] = waiter
+                owner = True
+
+        if not owner:
+            return copy.deepcopy(await waiter)
+
+        try:
+            payload = await _fetch_json(session, url, **kwargs)
+        except Exception as exc:
+            if not waiter.done():
+                waiter.set_exception(exc)
+            raise
+        else:
+            self._store[key] = (time.monotonic() + self.ttl, payload)
+            self._evict()
+            if not waiter.done():
+                waiter.set_result(payload)
+            return copy.deepcopy(payload)
+        finally:
+            if self._inflight.get(key) is waiter:
+                self._inflight.pop(key, None)
+
+
+_json_cache = _ResponseCache()
+
+
+async def _fetch_json(session: aiohttp.ClientSession, url: str, **kwargs: Any) -> Any:
     async with session.get(url, **kwargs) as resp:
         if resp.status >= 400:
             raise aiohttp.ClientResponseError(
@@ -257,6 +333,10 @@ async def _json(session: aiohttp.ClientSession, url: str, **kwargs: Any) -> Any:
                 message=resp.reason or "",
             )
         return await resp.json(content_type=None)
+
+
+async def _json(session: aiohttp.ClientSession, url: str, **kwargs: Any) -> Any:
+    return await _json_cache.get_json(session, url, **kwargs)
 
 
 class TMDBClient:

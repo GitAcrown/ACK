@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
+from datetime import date
 from typing import Any
 
 import aiohttp
@@ -155,6 +157,81 @@ RATING_CHOICES = [
     app_commands.Choice(name=f"{format_stars_select(r)}/5", value=r)
     for r in VALID_RATINGS
 ]
+
+_MONTHS_FR = (
+    "janvier", "février", "mars", "avril", "mai", "juin",
+    "juillet", "août", "septembre", "octobre", "novembre", "décembre",
+)
+_DATE_DMY = re.compile(r"^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})$")
+_DATE_YMD = re.compile(r"^(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})$")
+
+
+def experienced_verb(media_type: str) -> str:
+    return {
+        "movie": "Vu",
+        "tv": "Vu",
+        "game": "Joué",
+        "album": "Écouté",
+        "track": "Écouté",
+        "book": "Lu",
+    }.get(media_type, "Vu")
+
+
+def format_experienced_date(raw: str) -> str:
+    if not raw:
+        return ""
+    try:
+        year, month, day = (int(part) for part in raw.split("-"))
+        return f"{day} {_MONTHS_FR[month - 1]} {year}"
+    except (ValueError, IndexError):
+        return raw
+
+
+def experienced_line(media_type: str, raw: str | None) -> str:
+    if not raw:
+        return ""
+    return f"-# {experienced_verb(media_type)} le {format_experienced_date(raw)}"
+
+
+def experienced_from_row(row: Any) -> str:
+    if row is None:
+        return ""
+    if isinstance(row, dict):
+        return str(row.get("experienced_at") or "")
+    try:
+        return str(row["experienced_at"] or "")
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+def parse_experienced_date(raw: str) -> tuple[str | None, str | None]:
+    text = (raw or "").strip()
+    if not text:
+        return "", None
+    match = _DATE_DMY.match(text) or _DATE_YMD.match(text)
+    if match is None:
+        return None, "Indique une date du type `12/03/2024` ou `2024-03-12`."
+    if match.re is _DATE_YMD:
+        year, month, day = (int(match.group(i)) for i in (1, 2, 3))
+    else:
+        day, month, year = (int(match.group(i)) for i in (1, 2, 3))
+    try:
+        date(year, month, day)
+    except ValueError:
+        return None, "Cette date n'existe pas."
+    return f"{year:04d}-{month:02d}-{day:02d}", None
+
+
+def experienced_to_input(raw: str) -> str:
+    if not raw:
+        return ""
+    parts = raw.split("-")
+    if len(parts) != 3:
+        return raw
+    try:
+        return f"{int(parts[2]):02d}/{parts[1]}/{parts[0]}"
+    except ValueError:
+        return raw
 
 
 def parse_rating(raw: str) -> float | None:
@@ -346,40 +423,53 @@ def _footer_line(hit: MediaHit) -> str:
     return "  ·  ".join(parts)
 
 
-def _fiche_body(
+def append_fiche_sections(
+    body: list[discord.ui.Item],
     hit: MediaHit,
     *,
     avg: float | None,
     count: int,
     my_review: dict | None,
     social_line: str = "",
-) -> str:
-    lines: list[str] = []
+) -> None:
+    head: list[str] = []
     official = _official_line(hit)
     if official:
-        lines.append(official)
+        head.append(official)
     if count:
         stars = format_stars(avg or 0)
-        lines.append(f"Serveur · {stars}  **{(avg or 0):.1f}/5**  ·  {count} critique{'s' if count > 1 else ''}")
+        head.append(
+            f"**Serveur** · {stars}  **{(avg or 0):.1f}/5**  ·  "
+            f"{count} critique{'s' if count > 1 else ''}"
+        )
     else:
-        lines.append("*Aucune note sur ce serveur pour l'instant.*")
+        head.append("*Aucune note sur ce serveur pour l'instant.*")
     if my_review:
         comment = pretty.shorten_text(my_review["comment"], 180) if my_review["comment"] else ""
         mine = f"Ta note · {format_stars(my_review['rating'])}  **{my_review['rating']:g}/5**"
         if comment:
             mine += f"\n*{comment}*"
-        lines.append(mine)
-    if social_line:
-        lines.append(f"-# {social_line}")
+        seen = experienced_line(hit.media_type, experienced_from_row(my_review))
+        if seen:
+            mine += f"\n{seen}"
+        head.append(mine)
     price = _price_line(hit)
     if price:
-        lines.append(price)
+        head.append(price)
+
+    tail: list[str] = []
+    if social_line:
+        tail.append(f"-# {social_line}")
     overview = pretty.shorten_text(hit.overview, 380) if hit.overview else ""
     if overview:
-        lines.append(overview)
+        tail.append(overview)
     elif not official and not count:
-        lines.append("-# Aucune description disponible.")
-    return "\n".join(lines)
+        tail.append("-# Aucune description disponible.")
+
+    body.append(section_with_thumbnail("\n".join(head), hit.poster_url))
+    if tail:
+        body.append(discord.ui.Separator())
+        body.append(discord.ui.TextDisplay("\n".join(tail)))
 
 
 def fiche_intro(hit: MediaHit) -> list[discord.ui.Item]:
@@ -417,17 +507,13 @@ def render_published_fiche(
     view = discord.ui.LayoutView(timeout=None)
     body: list[discord.ui.Item] = []
     body.extend(fiche_intro(hit))
-    body.append(section_with_thumbnail(
-        _fiche_body(hit, avg=avg, count=count, my_review=None, social_line=social),
-        hit.poster_url,
-    ))
+    append_fiche_sections(body, hit, avg=avg, count=count, my_review=None, social_line=social)
     footer = _footer_line(hit)
     if footer:
         body.append(discord.ui.Separator())
         body.append(discord.ui.TextDisplay(f"-# {footer}"))
     if live:
         body.append(discord.ui.ActionRow(
-            FicheDynButton(wid, "fiche", label="Fiche", style=discord.ButtonStyle.primary),
             FicheDynButton(wid, "critiques", label=f"Critiques ({count})"),
             FicheDynButton(wid, "noter", label="Ma note", style=discord.ButtonStyle.green),
         ))
@@ -568,6 +654,7 @@ def build_announce_view(
     rating: float,
     comment: str,
     updated: bool,
+    experienced_at: str = "",
 ) -> discord.ui.LayoutView:
     view = discord.ui.LayoutView(timeout=None)
     container = discord.ui.Container()
@@ -575,6 +662,9 @@ def build_announce_view(
     header = f"{_titled(mention, title)}\n{verb}\n{_title_line(hit)}\n{format_stars(rating)}  **{rating:g}/5**"
     if comment:
         header += f"\n*{pretty.shorten_text(comment, 240)}*"
+    seen = experienced_line(hit.media_type, experienced_at)
+    if seen:
+        header += f"\n{seen}"
     container.add_item(section_with_thumbnail(header, avatar_url or hit.poster_url))
     container.add_item(discord.ui.Separator())
     container.add_item(discord.ui.TextDisplay(f"-# {_meta_line(hit)}" + (f"  ·  [{_link_label(hit)}]({hit.url})" if hit.url else "")))
@@ -603,7 +693,15 @@ def _review_saved_lines(hit: MediaHit, rating: float, created: bool, award: XpAw
 
 
 class RateModal(discord.ui.Modal, title="Noter cette œuvre"):
-    def __init__(self, parent: Any, *, max_comment: int, default_rating: float | None, default_comment: str):
+    def __init__(
+        self,
+        parent: Any,
+        *,
+        max_comment: int,
+        default_rating: float | None,
+        default_comment: str,
+        default_experienced: str = "",
+    ):
         super().__init__()
         self._hub = parent
         self.rating_input = discord.ui.TextInput(
@@ -621,8 +719,16 @@ class RateModal(discord.ui.Modal, title="Noter cette œuvre"):
             max_length=max_comment,
             required=False,
         )
+        self.date_input = discord.ui.TextInput(
+            label="Date (optionnel)",
+            placeholder="Ex. 12/03/2024 — vu, joué, écouté ou lu",
+            default=experienced_to_input(default_experienced) or None,
+            max_length=12,
+            required=False,
+        )
         self.add_item(self.rating_input)
         self.add_item(self.comment_input)
+        self.add_item(self.date_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         rating = parse_rating(self.rating_input.value)
@@ -632,12 +738,21 @@ class RateModal(discord.ui.Modal, title="Noter cette œuvre"):
                 ephemeral=True,
             )
             return
+        experienced_at, date_error = parse_experienced_date(str(self.date_input.value or ""))
+        if date_error:
+            await interaction.response.send_message(f"**Erreur ·** {date_error}", ephemeral=True)
+            return
         from_public = bool(self._hub.from_published_modal)
         orphan = from_public or (self._hub._interaction is None and self._hub._message is None)
         await interaction.response.defer(ephemeral=orphan or from_public)
         if orphan and not from_public:
             self._hub._interaction = interaction
-        await self._hub.save_review(interaction, rating, str(self.comment_input.value or "").strip())
+        await self._hub.save_review(
+            interaction,
+            rating,
+            str(self.comment_input.value or "").strip(),
+            experienced_at or "",
+        )
 
 
 class MyNoteEditButton(discord.ui.Button):
@@ -656,6 +771,7 @@ class MyNoteEditButton(discord.ui.Button):
                 max_comment=await self._hub.cog.get_comment_max(self._hub.guild),
                 default_rating=existing.get("rating"),
                 default_comment=existing.get("comment") or "",
+                default_experienced=existing.get("experienced_at") or "",
             )
         )
 
@@ -729,6 +845,9 @@ class MyNoteView(ReviewsLayout):
             )
             if mine.get("comment"):
                 text += f"*{pretty.shorten_text(mine['comment'], 240)}*\n"
+            seen = experienced_line(hit.media_type, mine.get("experienced_at"))
+            if seen:
+                text += f"{seen}\n"
             text += f"-# Ta note · {_meta_line(hit)}"
         else:
             text = (
@@ -741,8 +860,12 @@ class MyNoteView(ReviewsLayout):
             actions.append(MyNoteDeleteButton(self))
         self.set_layout([section_with_thumbnail(text, hit.poster_url)], discord.ui.ActionRow(*actions))
 
-    async def save_review(self, interaction: discord.Interaction, rating: float, comment: str) -> None:
-        created, award = await self.cog.upsert_review(self.guild, interaction.user, self.hit, rating, comment)
+    async def save_review(
+        self, interaction: discord.Interaction, rating: float, comment: str, experienced_at: str = "",
+    ) -> None:
+        created, award = await self.cog.upsert_review(
+            self.guild, interaction.user, self.hit, rating, comment, experienced_at=experienced_at,
+        )
         media_id = await self.cog.lookup_media_id(self.guild, self.hit)
         self.my_review = await self.cog.get_review(self.guild, self.author_id, media_id) if media_id else None
         self._build()
@@ -750,7 +873,10 @@ class MyNoteView(ReviewsLayout):
             await sync_published_fiche(self.cog, self.guild, self.published_wid, self.hit)
         await apply_view(interaction, self)
         await interaction.followup.send("\n".join(_review_saved_lines(self.hit, rating, created, award)), ephemeral=True)
-        await self.cog.announce_review(self.guild, interaction.user, self.hit, rating, comment, updated=not created)
+        await self.cog.announce_review(
+            self.guild, interaction.user, self.hit, rating, comment,
+            updated=not created, experienced_at=experienced_at,
+        )
 
     async def delete_review(self, interaction: discord.Interaction) -> None:
         await self.cog.delete_review(self.guild, self.author_id, self.hit)
@@ -770,10 +896,7 @@ class PublicFichePeekView(ReviewsLayout):
         self._interaction: discord.Interaction | None = None
         body: list[discord.ui.Item] = []
         body.extend(fiche_intro(hit))
-        body.append(section_with_thumbnail(
-            _fiche_body(hit, avg=avg, count=count, my_review=None, social_line=social),
-            hit.poster_url,
-        ))
+        append_fiche_sections(body, hit, avg=avg, count=count, my_review=None, social_line=social)
         footer = _footer_line(hit)
         if footer:
             body.append(discord.ui.Separator())
@@ -877,6 +1000,9 @@ class PublicCritiquesView(ReviewsLayout):
             )
             if row["comment"]:
                 text += f"\n{pretty.shorten_text(row['comment'], 220)}"
+            seen = experienced_line(hit.media_type, experienced_from_row(row))
+            if seen:
+                text += f"\n{seen}"
             body.append(section_with_thumbnail(text, avatar))
         total_pages = max(1, (len(self.reviews) + REVIEWS_PAGE - 1) // REVIEWS_PAGE)
         page_note = (
@@ -960,6 +1086,7 @@ class RateButton(discord.ui.Button):
                 max_comment=max_comment,
                 default_rating=existing.get("rating", parent.pending_rating if interaction.user.id == parent.author_id else None),
                 default_comment=existing.get("comment") or (parent.pending_comment if interaction.user.id == parent.author_id else ""),
+                default_experienced=existing.get("experienced_at") or "",
             )
         )
 
@@ -994,6 +1121,27 @@ class PublishFicheButton(discord.ui.Button):
             interaction,
             followup=True,
         )
+
+
+class ProfileShareButton(discord.ui.Button):
+    def __init__(self, parent: "ProfileView"):
+        super().__init__(label="Partager le profil", style=discord.ButtonStyle.secondary)
+        self._hub = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        was_editable = self._hub.editable
+        self._hub.editable = False
+        body, _rows = self._hub._profil_layout()
+        self._hub.editable = was_editable
+        view = discord.ui.LayoutView(timeout=None)
+        if body:
+            view.add_item(discord.ui.Container(*body))
+        try:
+            await interaction.followup.send(view=view, allowed_mentions=NO_PINGS)
+        except discord.HTTPException as exc:
+            logger.warning("Impossible de partager le profil : %s", exc)
+            await interaction.followup.send("**Erreur ·** Impossible de publier ce profil.", ephemeral=True)
 
 
 class HubTabButton(discord.ui.Button):
@@ -1104,8 +1252,12 @@ class MediaSessionView(ReviewsLayout):
         )
         self.titles = await self.cog.get_titles(self.guild, [int(row["user_id"]) for row in self.reviews])
 
-    async def save_review(self, interaction: discord.Interaction, rating: float, comment: str) -> None:
-        created, award = await self.cog.upsert_review(self.guild, interaction.user, self.hit, rating, comment)
+    async def save_review(
+        self, interaction: discord.Interaction, rating: float, comment: str, experienced_at: str = "",
+    ) -> None:
+        created, award = await self.cog.upsert_review(
+            self.guild, interaction.user, self.hit, rating, comment, experienced_at=experienced_at,
+        )
         await self.reload_stats()
         self.pending_rating = None
         self.tab = "fiche"
@@ -1114,7 +1266,10 @@ class MediaSessionView(ReviewsLayout):
         if not self.from_published_modal:
             await self.refresh(interaction)
         await interaction.followup.send("\n".join(_review_saved_lines(self.hit, rating, created, award)), ephemeral=True)
-        await self.cog.announce_review(self.guild, interaction.user, self.hit, rating, comment, updated=not created)
+        await self.cog.announce_review(
+            self.guild, interaction.user, self.hit, rating, comment,
+            updated=not created, experienced_at=experienced_at,
+        )
 
     def _build(self) -> None:
         hit = self.hit
@@ -1137,16 +1292,14 @@ class MediaSessionView(ReviewsLayout):
 
         if self.tab == "fiche":
             body.extend(fiche_intro(hit))
-            body.append(section_with_thumbnail(
-                _fiche_body(
-                    hit,
-                    avg=self.avg,
-                    count=self.count,
-                    my_review=self.my_review if self.ephemeral and not self.published_wid else None,
-                    social_line=self.social_line,
-                ),
-                hit.poster_url,
-            ))
+            append_fiche_sections(
+                body,
+                hit,
+                avg=self.avg,
+                count=self.count,
+                my_review=self.my_review if self.ephemeral and not self.published_wid else None,
+                social_line=self.social_line,
+            )
             footer = _footer_line(hit)
             if footer:
                 body.append(discord.ui.Separator())
@@ -1171,6 +1324,9 @@ class MediaSessionView(ReviewsLayout):
                     )
                     if row["comment"]:
                         text += f"\n{pretty.shorten_text(row['comment'], 220)}"
+                    seen = experienced_line(hit.media_type, experienced_from_row(row))
+                    if seen:
+                        text += f"\n{seen}"
                     body.append(section_with_thumbnail(text, avatar))
                 total_pages = max(1, (len(self.reviews) + REVIEWS_PAGE - 1) // REVIEWS_PAGE)
                 page_note = (
@@ -1630,6 +1786,7 @@ class ProfileView(ReviewsLayout):
             HubTabButton(self, "profil", "Profil"),
             HubTabButton(self, "journal", f"Journal ({self.review_count})"),
             HubTabButton(self, "affinites", "Affinités"),
+            ProfileShareButton(self),
         )
 
     def _page_nav(self, attr: str, max_page: int) -> discord.ui.ActionRow | None:
@@ -1701,6 +1858,9 @@ class ProfileView(ReviewsLayout):
             text = f"{format_stars(row['rating'])}  **{hit.title}**{year}\n-# {type_label(hit.media_type)}"
             if row["comment"]:
                 text += f"\n{pretty.shorten_text(row['comment'], 180)}"
+            seen = experienced_line(hit.media_type, experienced_from_row(row))
+            if seen:
+                text += f"\n{seen}"
             body.append(section_with_thumbnail(text, hit.poster_url))
         rows.append(discord.ui.ActionRow(JournalOpenSelect(self, page_items)))
         nav = self._page_nav("journal_page", max_page)
@@ -1905,6 +2065,9 @@ class ServerHubView(ReviewsLayout):
             )
             if row["comment"]:
                 text += f"\n*{pretty.shorten_text(row['comment'], 180)}*"
+            seen = experienced_line(hit.media_type, experienced_from_row(row))
+            if seen:
+                text += f"\n{seen}"
             body.append(section_with_thumbnail(text, avatar or hit.poster_url))
         rows.append(discord.ui.ActionRow(RecentOpenSelect(self, page_items)))
         nav = self._page_nav("recent_page", max_page)
@@ -2145,6 +2308,7 @@ class Reviews(commands.Cog):
         self.data = dataio.get_instance(self)
         self._http: aiohttp.ClientSession | None = None
         self.catalog: MediaCatalog | None = None  # type: ignore[assignment]
+        self._schema_ready: set[int] = set()
 
         settings = dataio.DictTableBuilder(
             "settings",
@@ -2179,6 +2343,7 @@ class Reviews(commands.Cog):
                 media_id INTEGER NOT NULL,
                 rating REAL NOT NULL,
                 comment TEXT NOT NULL DEFAULT '',
+                experienced_at TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 UNIQUE(user_id, media_id)
@@ -2314,6 +2479,15 @@ class Reviews(commands.Cog):
         xp_by_user = {int(row["user_id"]): int(row["xp"]) for row in rows}
         return {user_id: title_for_level(level_for_xp(xp_by_user.get(user_id, 0))) for user_id in unique}
 
+    async def _ensure_schema(self, guild: discord.Guild) -> None:
+        if guild.id in self._schema_ready:
+            return
+        db = self.data.get(guild)
+        columns = await db.column_names("reviews")
+        if "experienced_at" not in columns:
+            await db.execute("ALTER TABLE reviews ADD COLUMN experienced_at TEXT NOT NULL DEFAULT ''")
+        self._schema_ready.add(guild.id)
+
     async def get_favorites(
         self, guild: discord.Guild, user_id: int
     ) -> list[tuple[MediaHit, float | None] | None]:
@@ -2360,6 +2534,7 @@ class Reviews(commands.Cog):
     async def load_journal(
         self, guild: discord.Guild, user_id: int, media_type: str = "all"
     ) -> list[tuple[MediaHit, Any]]:
+        await self._ensure_schema(guild)
         db = self.data.get(guild)
         if media_type == "all":
             rows = await db.fetchall(
@@ -2383,6 +2558,7 @@ class Reviews(commands.Cog):
         return [(hit_from_row(row), row) for row in rows]
 
     async def load_recent(self, guild: discord.Guild, *, limit: int = 40) -> list[tuple[MediaHit, Any]]:
+        await self._ensure_schema(guild)
         rows = await self.data.get(guild).fetchall(
             """SELECT r.*, m.source, m.source_id, m.media_type, m.title, m.subtitle, m.year,
                       m.poster_url, m.url, m.overview, m.genres, m.extra_json
@@ -2681,12 +2857,14 @@ class Reviews(commands.Cog):
         return float(row["avg_rating"]), int(row["n"])
 
     async def list_reviews(self, guild: discord.Guild, media_id: int) -> list[Any]:
+        await self._ensure_schema(guild)
         return await self.data.get(guild).fetchall(
             "SELECT * FROM reviews WHERE media_id=? ORDER BY updated_at DESC",
             media_id,
         )
 
     async def get_review(self, guild: discord.Guild, user_id: int, media_id: int) -> dict | None:
+        await self._ensure_schema(guild)
         row = await self.data.get(guild).fetchone(
             "SELECT * FROM reviews WHERE user_id=? AND media_id=?",
             user_id,
@@ -2694,7 +2872,12 @@ class Reviews(commands.Cog):
         )
         if row is None:
             return None
-        return {"rating": float(row["rating"]), "comment": row["comment"] or "", "updated_at": row["updated_at"]}
+        return {
+            "rating": float(row["rating"]),
+            "comment": row["comment"] or "",
+            "updated_at": row["updated_at"],
+            "experienced_at": experienced_from_row(row),
+        }
 
     async def upsert_review(
         self,
@@ -2703,7 +2886,9 @@ class Reviews(commands.Cog):
         hit: MediaHit,
         rating: float,
         comment: str,
+        experienced_at: str = "",
     ) -> tuple[bool, XpAward]:
+        await self._ensure_schema(guild)
         max_len = await self.get_comment_max(guild)
         comment = comment.strip()[:max_len]
         media_id = await self.upsert_media(guild, hit)
@@ -2717,20 +2902,22 @@ class Reviews(commands.Cog):
         created = existing is None
         if existing:
             await self.data.get(guild).execute(
-                "UPDATE reviews SET rating=?, comment=?, updated_at=? WHERE user_id=? AND media_id=?",
+                "UPDATE reviews SET rating=?, comment=?, experienced_at=?, updated_at=? WHERE user_id=? AND media_id=?",
                 rating,
                 comment,
+                experienced_at,
                 now,
                 user.id,
                 media_id,
             )
         else:
             await self.data.get(guild).execute(
-                "INSERT INTO reviews (user_id, media_id, rating, comment, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO reviews (user_id, media_id, rating, comment, experienced_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 user.id,
                 media_id,
                 rating,
                 comment,
+                experienced_at,
                 now,
                 now,
             )
@@ -2761,6 +2948,7 @@ class Reviews(commands.Cog):
         comment: str,
         *,
         updated: bool,
+        experienced_at: str = "",
     ) -> None:
         channel = await self.get_announce_channel(guild)
         if channel is None:
@@ -2775,6 +2963,7 @@ class Reviews(commands.Cog):
             rating=rating,
             comment=comment,
             updated=updated,
+            experienced_at=experienced_at,
         )
         try:
             await channel.send(view=view, allowed_mentions=discord.AllowedMentions.none())
@@ -2865,36 +3054,6 @@ class Reviews(commands.Cog):
         )
         await view.start(interaction, deferred=True)
 
-    @critique_group.command(name="fiche")
-    @app_commands.rename(query="recherche", media_type="type")
-    @app_commands.describe(query="Titre, tmdb:Dune, tmdb:27205, ou une URL", media_type="Type de média")
-    @app_commands.choices(media_type=TYPE_CHOICES)
-    async def critique_fiche(
-        self,
-        interaction: discord.Interaction,
-        query: str,
-        media_type: str = "all",
-    ) -> None:
-        """Affiche la fiche d'une œuvre et les critiques du serveur."""
-        guild = interaction.guild
-        if not isinstance(guild, discord.Guild):
-            return await interaction.response.send_message(
-                "**Erreur ·** Cette commande ne peut être utilisée que sur un serveur.", ephemeral=True
-            )
-        await interaction.response.defer(ephemeral=True)
-        hits = await self._search_or_reply(interaction, query, media_type)
-        if not hits:
-            return
-        if len(hits) == 1:
-            await send_published_fiche(self, guild, hits[0], interaction, followup=True)
-            try:
-                await interaction.delete_original_response()
-            except discord.HTTPException:
-                pass
-            return
-        view = MediaSessionView(self, guild, hits, author_id=interaction.user.id, ephemeral=True)
-        await view.start(interaction, deferred=True)
-
     @critique_group.command(name="profil")
     @app_commands.rename(member="membre")
     @app_commands.describe(member="Membre dont afficher le profil, le journal et les affinités")
@@ -2964,7 +3123,7 @@ class Reviews(commands.Cog):
             return await interaction.response.send_message(
                 "**Erreur ·** Cette commande ne peut être utilisée que sur un serveur.", ephemeral=True
             )
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
         recent = await self.load_recent(guild)
         catalog = await self.load_catalog(
             guild,
