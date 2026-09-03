@@ -1139,9 +1139,6 @@ class ProfileView(ReviewsLayout):
         self._interaction: discord.Interaction | None = None
         self._build()
 
-    def _display_name(self) -> str:
-        return self.member.display_name if hasattr(self.member, "display_name") else str(self.member)
-
     def _name(self, user_id: int) -> str:
         name, _avatar = _user_display(self.guild, self.cog.bot, user_id)
         return name
@@ -1151,6 +1148,23 @@ class ProfileView(ReviewsLayout):
             _mention(self.guild, self.cog.bot, user_id),
             self.titles.get(user_id, title_for_level(1)),
         )
+
+    def _profile_header(self, extra: str = "") -> str:
+        level, into, need, total = level_progress(self.xp)
+        title = self.titles.get(self.member.id, title_for_level(level))
+        mention = _mention(self.guild, self.cog.bot, self.member.id)
+        notes = f"**{self.review_count}** note{'s' if self.review_count != 1 else ''}"
+        if self.average is not None:
+            notes += f"  ·  moyenne **{self.average:.1f}/5**"
+        lines = [
+            f"## {mention}",
+            f"{XP} **{total} XP** · niveau **{level}**  ·  {notes}",
+            f"-# {into}/{need} vers le niveau {level + 1}",
+        ]
+        if extra:
+            lines.append(extra)
+        lines.append(f"-# {title}")
+        return "\n".join(lines)
 
     def _tabs_row(self) -> discord.ui.ActionRow:
         return discord.ui.ActionRow(
@@ -1170,21 +1184,8 @@ class ProfileView(ReviewsLayout):
         return discord.ui.ActionRow(prev_btn, next_btn)
 
     def _profil_layout(self) -> tuple[list[discord.ui.Item], list[discord.ui.ActionRow]]:
-        level, into, need, total = level_progress(self.xp)
-        title = title_for_level(level)
-        stats = f"**{self.review_count}** note{'s' if self.review_count != 1 else ''}"
-        if self.average is not None:
-            stats += f"  ·  moyenne **{self.average:.1f}/5**"
-        header = (
-            f"## {pretty.shorten_text(self._display_name(), 80)}\n"
-            f"{_mention(self.guild, self.cog.bot, self.member.id)}\n"
-            f"-# {title}\n"
-            f"{XP} **{total} XP** · niveau **{level}**\n"
-            f"-# {into}/{need} vers le niveau {level + 1}\n"
-            f"{stats}"
-        )
         avatar = self.member.display_avatar.url if hasattr(self.member, "display_avatar") else None
-        body: list[discord.ui.Item] = [section_with_thumbnail(header, avatar)]
+        body: list[discord.ui.Item] = [section_with_thumbnail(self._profile_header(), avatar)]
         for index, (slot, label) in enumerate(FAVORITE_LABELS.items()):
             body.append(discord.ui.Separator())
             entry = self.favorites[slot - 1] if slot - 1 < len(self.favorites) else None
@@ -1220,20 +1221,14 @@ class ProfileView(ReviewsLayout):
         return body, rows
 
     def _journal_layout(self) -> tuple[list[discord.ui.Item], list[discord.ui.ActionRow]]:
-        stats = f"{len(self.journal_entries)} note{'s' if len(self.journal_entries) != 1 else ''}"
-        if self.average is not None:
-            stats += f"  ·  moyenne {format_stars(self.average)} {self.average:.1f}/5"
+        extra = ""
         types: dict[str, int] = {}
         for hit, _row in self.journal_entries:
             types[hit.media_type] = types.get(hit.media_type, 0) + 1
         if types:
             top_type = max(types, key=types.get)
-            stats += f"  ·  {types[top_type]} {type_label(top_type).lower()}{'s' if types[top_type] > 1 else ''}"
-        body: list[discord.ui.Item] = [
-            discord.ui.TextDisplay(
-                f"## {pretty.shorten_text(self._display_name(), 80)}\n-# Journal · {stats}"
-            )
-        ]
+            extra = f"-# {types[top_type]} {type_label(top_type).lower()}{'s' if types[top_type] > 1 else ''}"
+        body: list[discord.ui.Item] = [discord.ui.TextDisplay(self._profile_header(extra))]
         rows: list[discord.ui.ActionRow] = []
         if not self.journal_entries:
             body.append(discord.ui.TextDisplay("*Aucune œuvre notée pour l'instant.*"))
@@ -1257,10 +1252,13 @@ class ProfileView(ReviewsLayout):
     def _affinites_layout(self) -> tuple[list[discord.ui.Item], list[discord.ui.ActionRow]]:
         _me, avatar = _user_display(self.guild, self.cog.bot, self.member.id)
         rows: list[discord.ui.ActionRow] = []
+        extra = (
+            f"-# {len(self.affinities)} affinité(s) · min. {MIN_AFFINITY_OVERLAP} en commun"
+            if self.affinities else ""
+        )
         if not self.affinities:
             body = [section_with_thumbnail(
-                f"## {pretty.shorten_text(self._display_name(), 80)}\n"
-                f"{self._person(self.member.id)}\n"
+                f"{self._profile_header()}\n"
                 f"*Pas encore assez d'œuvres en commun avec quelqu'un "
                 f"(minimum {MIN_AFFINITY_OVERLAP}).*",
                 avatar,
@@ -1269,9 +1267,7 @@ class ProfileView(ReviewsLayout):
         twins = self.affinities[:3]
         rival = min(self.affinities, key=lambda a: (a.percent, -a.overlap))
         lines = [
-            f"## {pretty.shorten_text(self._display_name(), 80)}",
-            self._person(self.member.id),
-            f"-# {len(self.affinities)} affinité(s) · min. {MIN_AFFINITY_OVERLAP} en commun",
+            self._profile_header(extra),
             "",
             f"### {TWIN} Jumeaux",
         ]
