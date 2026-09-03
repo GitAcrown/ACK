@@ -129,7 +129,7 @@ def format_stars(rating: float) -> str:
 
 
 def format_stars_compact(rating: float) -> str:
-    """Une seule étoile + note, pour labels courts (Select, slash, boutons)."""
+    """Une seule étoile custom + note, pour boutons et texte rich."""
     if rating <= 0:
         icon = STAR_EMPTY
     elif rating % 1 >= 0.45:
@@ -139,8 +139,19 @@ def format_stars_compact(rating: float) -> str:
     return f"{icon} {rating:g}"
 
 
+def format_stars_select(rating: float) -> str:
+    """Étoiles unicode : un Select n'affiche pas les customs dans label/description."""
+    if rating <= 0:
+        icon = "☆"
+    elif rating % 1 >= 0.45:
+        icon = "★☆"
+    else:
+        icon = "★"
+    return f"{icon} {rating:g}"
+
+
 RATING_CHOICES = [
-    app_commands.Choice(name=f"{format_stars_compact(r)}/5", value=r)
+    app_commands.Choice(name=f"{format_stars_select(r)}/5", value=r)
     for r in VALID_RATINGS
 ]
 
@@ -418,15 +429,8 @@ def render_published_fiche(
             FicheDynButton(wid, "fiche", label="Fiche", style=discord.ButtonStyle.primary),
             FicheDynButton(wid, "critiques", label=f"Critiques ({count})"),
         ))
-        actions: list[discord.ui.Item] = [
-            FicheDynButton(wid, "noter", label="Noter", style=discord.ButtonStyle.green),
-        ]
-        if hit.url:
-            actions.append(discord.ui.Button(label=_link_label(hit), url=hit.url, style=discord.ButtonStyle.link))
-        body.append(discord.ui.ActionRow(*actions))
-    elif hit.url:
         body.append(discord.ui.ActionRow(
-            discord.ui.Button(label=_link_label(hit), url=hit.url, style=discord.ButtonStyle.link)
+            FicheDynButton(wid, "noter", label="Noter", style=discord.ButtonStyle.green),
         ))
     view.add_item(discord.ui.Container(*body))
     return view
@@ -871,7 +875,10 @@ class MediaSessionView(ReviewsLayout):
         else:
             body.extend(fiche_intro(hit)[:2])
             if not self.reviews:
-                body.append(discord.ui.TextDisplay("*Pas encore de critique sur ce serveur.*"))
+                empty = "*Pas encore de critique sur ce serveur.*"
+                if hit.url:
+                    empty += f"\n-# [{_link_label(hit)}]({hit.url})"
+                body.append(discord.ui.TextDisplay(empty))
             else:
                 start = self.review_page * REVIEWS_PAGE
                 page_rows = self.reviews[start:start + REVIEWS_PAGE]
@@ -887,9 +894,13 @@ class MediaSessionView(ReviewsLayout):
                         text += f"\n{pretty.shorten_text(row['comment'], 220)}"
                     body.append(section_with_thumbnail(text, avatar))
                 total_pages = max(1, (len(self.reviews) + REVIEWS_PAGE - 1) // REVIEWS_PAGE)
-                body.append(discord.ui.TextDisplay(
-                    f"-# {self.count} critique(s) · moyenne {format_stars(self.avg or 0)} {(self.avg or 0):.1f}/5 · page {self.review_page + 1}/{total_pages}"
-                ))
+                page_note = (
+                    f"-# {self.count} critique(s) · moyenne {format_stars(self.avg or 0)} "
+                    f"{(self.avg or 0):.1f}/5 · page {self.review_page + 1}/{total_pages}"
+                )
+                if hit.url:
+                    page_note += f"  ·  [{_link_label(hit)}]({hit.url})"
+                body.append(discord.ui.TextDisplay(page_note))
 
         rate_label = "Noter"
         if self.ephemeral and self.pending_rating is not None and self.my_review is None:
@@ -903,8 +914,6 @@ class MediaSessionView(ReviewsLayout):
             actions.append(DeleteReviewButton(self))
         if self.ephemeral:
             actions.append(PublishFicheButton(self))
-        if hit.url:
-            actions.append(discord.ui.Button(label=_link_label(hit), url=hit.url, style=discord.ButtonStyle.link))
 
         rows.append(discord.ui.ActionRow(
             TabButton(self, "fiche", "Fiche"),
@@ -963,7 +972,7 @@ class JournalOpenSelect(discord.ui.Select):
     def __init__(self, parent: "ProfileView", page_items: list[tuple[MediaHit, Any]]):
         options = [
             discord.SelectOption(
-                label=pretty.shorten_text(f"{format_stars_compact(row['rating'])}  {hit.title}", 95),
+                label=pretty.shorten_text(f"{format_stars_select(row['rating'])}  {hit.title}", 95),
                 value=str(index),
                 description=pretty.shorten_text(f"{type_label(hit.media_type)} · {hit.year or '—'} · {row['rating']:g}/5", 95),
                 emoji=select_emoji(hit.media_type),
@@ -987,7 +996,7 @@ class CatalogOpenSelect(discord.ui.Select):
                 label=pretty.shorten_text(hit.title, 95),
                 value=str(index),
                 description=pretty.shorten_text(
-                    f"{type_label(hit.media_type)} · {format_stars_compact(avg)}/5 · {count} note{'s' if count > 1 else ''}",
+                    f"{type_label(hit.media_type)} · {format_stars_select(avg)}/5 · {count} note{'s' if count > 1 else ''}",
                     95,
                 ),
                 emoji=select_emoji(hit.media_type),
@@ -1010,7 +1019,7 @@ class RecentOpenSelect(discord.ui.Select):
             discord.SelectOption(
                 label=pretty.shorten_text(hit.title, 95),
                 value=str(index),
-                description=pretty.shorten_text(f"{format_stars_compact(row['rating'])}/5 · {type_label(hit.media_type)}", 95),
+                description=pretty.shorten_text(f"{format_stars_select(row['rating'])}/5 · {type_label(hit.media_type)}", 95),
                 emoji=select_emoji(hit.media_type),
             )
             for index, (hit, row) in enumerate(page_items)
