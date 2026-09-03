@@ -184,7 +184,47 @@ class TMDBClient:
             return (int(exact and year_match), int(exact or year_match), float(item.get("popularity") or 0))
 
         results.sort(key=rank, reverse=True)
-        return [self._from_search(item) for item in results[:limit]]
+        hits = [self._from_search(item) for item in results[:limit]]
+        await self._attach_people(hits)
+        return hits
+
+    async def _attach_people(self, hits: list[MediaHit]) -> None:
+        """Remplit le sous-titre (réalisateur / créateur) pour les Selects."""
+
+        async def one(hit: MediaHit) -> None:
+            if not hit.source_id:
+                return
+            try:
+                if hit.media_type == "movie":
+                    payload = await _json(
+                        self.session,
+                        f"{TMDB_BASE}/movie/{hit.source_id}/credits",
+                        params={"api_key": self.api_key, "language": "fr-FR"},
+                        timeout=aiohttp.ClientTimeout(total=6),
+                    )
+                    directors = [
+                        c.get("name") for c in payload.get("crew") or []
+                        if c.get("job") == "Director" and c.get("name")
+                    ]
+                    if directors:
+                        hit.subtitle = directors[0]
+                        hit.extra["director"] = directors[0]
+                elif hit.media_type == "tv":
+                    payload = await _json(
+                        self.session,
+                        f"{TMDB_BASE}/tv/{hit.source_id}",
+                        params={"api_key": self.api_key, "language": "fr-FR"},
+                        timeout=aiohttp.ClientTimeout(total=6),
+                    )
+                    created = [c.get("name") for c in payload.get("created_by") or [] if c.get("name")]
+                    if created:
+                        hit.subtitle = created[0]
+                        hit.extra["created_by"] = created
+            except Exception:
+                return
+
+        if hits:
+            await asyncio.gather(*(one(hit) for hit in hits))
 
     async def enrich(self, hit: MediaHit) -> MediaHit:
         if not self.available:
@@ -239,6 +279,10 @@ class TMDBClient:
         hit.poster_url = _poster(details.get("poster_path")) or hit.poster_url
         hit.overview = (details.get("overview") or "").strip() or hit.overview
         hit.genres = genres
+        if directors:
+            hit.subtitle = hit.subtitle or directors[0]
+        elif created_by:
+            hit.subtitle = hit.subtitle or created_by[0]
         hit.extra = {
             **hit.extra,
             "vote_average": details.get("vote_average") or hit.extra.get("vote_average") or 0,

@@ -160,6 +160,18 @@ def select_emoji(media_type: str) -> discord.PartialEmoji | None:
     return discord.PartialEmoji.from_str(raw)
 
 
+def select_hit_description(hit: MediaHit) -> str:
+    year = f"{hit.year}" if hit.year else "—"
+    parts = [type_label(hit.media_type), year]
+    by = hit.subtitle or hit.extra.get("director") or ""
+    if not by:
+        created = hit.extra.get("created_by") or []
+        by = created[0] if created else ""
+    if by:
+        parts.append(by)
+    return pretty.shorten_text(" · ".join(parts), 95)
+
+
 def section_with_thumbnail(text: str, url: str | None) -> discord.ui.Item:
     body = discord.ui.TextDisplay(text)
     if not url:
@@ -268,7 +280,7 @@ def _title_line(hit: MediaHit) -> str:
 
 def _meta_line(hit: MediaHit) -> str:
     parts = [type_label(hit.media_type)]
-    if hit.subtitle and hit.media_type in ("track", "album", "book", "game"):
+    if hit.subtitle:
         parts.append(hit.subtitle)
     parts.extend(hit.genres[:3])
     return "  ·  ".join(parts)
@@ -454,15 +466,11 @@ class MediaSelect(discord.ui.Select):
     def __init__(self, parent: "MediaSessionView", hits: list[MediaHit], selected: int):
         options = []
         for index, hit in enumerate(hits[:25]):
-            year = f"{hit.year}" if hit.year else "—"
-            desc_parts = [type_label(hit.media_type), year]
-            if hit.subtitle:
-                desc_parts.append(hit.subtitle)
             options.append(
                 discord.SelectOption(
                     label=pretty.shorten_text(hit.title, 95) or "Sans titre",
                     value=str(index),
-                    description=pretty.shorten_text(" · ".join(desc_parts), 95),
+                    description=select_hit_description(hit),
                     emoji=select_emoji(hit.media_type),
                     default=index == selected,
                 )
@@ -1055,15 +1063,11 @@ class FavoriteHitSelect(discord.ui.Select):
     def __init__(self, parent: "FavoritePickView", hits: list[MediaHit]):
         options = []
         for index, hit in enumerate(hits[:25]):
-            year = f"{hit.year}" if hit.year else "—"
-            desc_parts = [type_label(hit.media_type), year]
-            if hit.subtitle:
-                desc_parts.append(hit.subtitle)
             options.append(
                 discord.SelectOption(
                     label=pretty.shorten_text(hit.title, 95) or "Sans titre",
                     value=str(index),
-                    description=pretty.shorten_text(" · ".join(desc_parts), 95),
+                    description=select_hit_description(hit),
                     emoji=select_emoji(hit.media_type),
                 )
             )
