@@ -41,7 +41,7 @@ async def apply_view(interaction: discord.Interaction, view: discord.ui.LayoutVi
 
 
 class ReviewsLayout(discord.ui.LayoutView):
-    """LayoutView ACK : corps dans un Container, boutons en ActionRow de premier niveau."""
+    """LayoutView ACK : un Container (texte + ActionRows), comme MARIA."""
 
     async def on_error(
         self,
@@ -53,7 +53,7 @@ class ReviewsLayout(discord.ui.LayoutView):
         try:
             if not interaction.response.is_done():
                 await interaction.response.send_message(
-                    "**Erreur ·** Action impossible pour le moment.",
+                    "**Erreur ·** Le bouton a planté. Réessaie après un `&reload reviews`.",
                     ephemeral=True,
                 )
         except discord.HTTPException:
@@ -61,11 +61,12 @@ class ReviewsLayout(discord.ui.LayoutView):
 
     def set_layout(self, body: list[discord.ui.Item], *rows: discord.ui.ActionRow | None) -> None:
         self.clear_items()
-        if body:
-            self.add_item(discord.ui.Container(*body))
+        children = list(body)
         for row in rows:
             if row is not None:
-                self.add_item(row)
+                children.append(row)
+        if children:
+            self.add_item(discord.ui.Container(*children))
 
 VALID_RATINGS = tuple(i / 2 for i in range(11))
 DEFAULT_COMMENT_MAX = 280
@@ -414,7 +415,7 @@ def build_announce_view(
 class RateModal(discord.ui.Modal, title="Noter cette œuvre"):
     def __init__(self, parent: "MediaSessionView", *, max_comment: int, default_rating: float | None, default_comment: str):
         super().__init__()
-        self._parent = parent
+        self._hub = parent
         self.rating_input = discord.ui.TextInput(
             label="Note (0 à 5, demies autorisées)",
             placeholder="Ex. 4.5",
@@ -442,7 +443,7 @@ class RateModal(discord.ui.Modal, title="Noter cette œuvre"):
             )
             return
         await interaction.response.defer()
-        await self._parent.save_review(interaction, rating, str(self.comment_input.value or "").strip())
+        await self._hub.save_review(interaction, rating, str(self.comment_input.value or "").strip())
 
 
 # ---------------------------------------------------------------------------
@@ -467,13 +468,13 @@ class MediaSelect(discord.ui.Select):
                 )
             )
         super().__init__(placeholder="Choisir une œuvre", options=options, min_values=1, max_values=1)
-        self._parent = parent
+        self._hub = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
-        self._parent.selected = int(self.values[0])
-        await self._parent.enrich_selected()
-        await self._parent.refresh(interaction)
+        self._hub.selected = int(self.values[0])
+        await self._hub.enrich_selected()
+        await self._hub.refresh(interaction)
 
 
 class TabButton(discord.ui.Button):
@@ -482,23 +483,23 @@ class TabButton(discord.ui.Button):
             label=label,
             style=discord.ButtonStyle.primary if parent.tab == tab else discord.ButtonStyle.secondary,
         )
-        self._parent = parent
+        self._hub = parent
         self._tab = tab
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        self._parent.tab = self._tab
-        self._parent.review_page = 0
-        self._parent._build()
-        await apply_view(interaction, self._parent)
+        self._hub.tab = self._tab
+        self._hub.review_page = 0
+        self._hub._build()
+        await apply_view(interaction, self._hub)
 
 
 class RateButton(discord.ui.Button):
     def __init__(self, parent: "MediaSessionView"):
         super().__init__(label="Noter", style=discord.ButtonStyle.green)
-        self._parent = parent
+        self._hub = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        parent = self._parent
+        parent = self._hub
         media_id = await parent.cog.lookup_media_id(parent.guild, parent.hit)
         existing = await parent.cog.get_review(parent.guild, interaction.user.id, media_id) if media_id else None
         pending = parent.pending_rating
@@ -521,28 +522,28 @@ class RateButton(discord.ui.Button):
 class DeleteReviewButton(discord.ui.Button):
     def __init__(self, parent: "MediaSessionView"):
         super().__init__(label="Supprimer ma note", style=discord.ButtonStyle.red)
-        self._parent = parent
+        self._hub = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
-        await self._parent.cog.delete_review(self._parent.guild, interaction.user.id, self._parent.hit)
-        self._parent.my_review = None
-        await self._parent.reload_stats()
-        await self._parent.refresh(interaction)
+        await self._hub.cog.delete_review(self._hub.guild, interaction.user.id, self._hub.hit)
+        self._hub.my_review = None
+        await self._hub.reload_stats()
+        await self._hub.refresh(interaction)
         await interaction.followup.send("**Critique supprimée ·** Ta note a été retirée.", ephemeral=True)
 
 
 class PublishFicheButton(discord.ui.Button):
     def __init__(self, parent: "MediaSessionView"):
         super().__init__(label="Publier la fiche", style=discord.ButtonStyle.secondary)
-        self._parent = parent
+        self._hub = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
         view = MediaSessionView(
-            self._parent.cog,
-            self._parent.guild,
-            [self._parent.hit],
+            self._hub.cog,
+            self._hub.guild,
+            [self._hub.hit],
             author_id=interaction.user.id,
             ephemeral=False,
         )
@@ -557,28 +558,28 @@ class HubTabButton(discord.ui.Button):
             label=label,
             style=discord.ButtonStyle.primary if parent.tab == tab else discord.ButtonStyle.secondary,
         )
-        self._parent = parent
+        self._hub = parent
         self._tab = tab
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        self._parent.tab = self._tab
-        self._parent._build()
-        await apply_view(interaction, self._parent)
+        self._hub.tab = self._tab
+        self._hub._build()
+        await apply_view(interaction, self._hub)
 
 
 class HubPageButton(discord.ui.Button):
     def __init__(self, parent: Any, attr: str, delta: int, label: str, max_page: int):
         super().__init__(label=label, style=discord.ButtonStyle.secondary)
-        self._parent = parent
+        self._hub = parent
         self._attr = attr
         self._delta = delta
         self._max_page = max_page
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        current = getattr(self._parent, self._attr)
-        setattr(self._parent, self._attr, max(0, min(self._max_page, current + self._delta)))
-        self._parent._build()
-        await apply_view(interaction, self._parent)
+        current = getattr(self._hub, self._attr)
+        setattr(self._hub, self._attr, max(0, min(self._max_page, current + self._delta)))
+        self._hub._build()
+        await apply_view(interaction, self._hub)
 
 
 class MediaSessionView(ReviewsLayout):
@@ -793,13 +794,13 @@ class MediaSessionView(ReviewsLayout):
 class _ReviewPageButton(discord.ui.Button):
     def __init__(self, parent: MediaSessionView, delta: int, label: str):
         super().__init__(label=label, style=discord.ButtonStyle.secondary)
-        self._parent = parent
+        self._hub = parent
         self._delta = delta
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        self._parent.review_page = max(0, self._parent.review_page + self._delta)
-        self._parent._build()
-        await apply_view(interaction, self._parent)
+        self._hub.review_page = max(0, self._hub.review_page + self._delta)
+        self._hub._build()
+        await apply_view(interaction, self._hub)
 
 
 # ---------------------------------------------------------------------------
@@ -818,13 +819,13 @@ class JournalOpenSelect(discord.ui.Select):
             for index, (hit, row) in enumerate(page_items)
         ]
         super().__init__(placeholder="Ouvrir une fiche", options=options)
-        self._parent = parent
+        self._hub = parent
         self._items = page_items
 
     async def callback(self, interaction: discord.Interaction) -> None:
         hit, _row = self._items[int(self.values[0])]
         await interaction.response.defer()
-        await open_public_fiche(self._parent.cog, self._parent.guild, interaction, hit)
+        await open_public_fiche(self._hub.cog, self._hub.guild, interaction, hit)
 
 
 class CatalogOpenSelect(discord.ui.Select):
@@ -842,13 +843,13 @@ class CatalogOpenSelect(discord.ui.Select):
             for index, (hit, avg, count) in enumerate(page_items)
         ]
         super().__init__(placeholder="Ouvrir une fiche", options=options)
-        self._parent = parent
+        self._hub = parent
         self._items = page_items
 
     async def callback(self, interaction: discord.Interaction) -> None:
         hit, _avg, _count = self._items[int(self.values[0])]
         await interaction.response.defer()
-        await open_public_fiche(self._parent.cog, self._parent.guild, interaction, hit)
+        await open_public_fiche(self._hub.cog, self._hub.guild, interaction, hit)
 
 
 class RecentOpenSelect(discord.ui.Select):
@@ -863,13 +864,13 @@ class RecentOpenSelect(discord.ui.Select):
             for index, (hit, row) in enumerate(page_items)
         ]
         super().__init__(placeholder="Ouvrir une fiche", options=options)
-        self._parent = parent
+        self._hub = parent
         self._items = page_items
 
     async def callback(self, interaction: discord.Interaction) -> None:
         hit, _row = self._items[int(self.values[0])]
         await interaction.response.defer()
-        await open_public_fiche(self._parent.cog, self._parent.guild, interaction, hit)
+        await open_public_fiche(self._hub.cog, self._hub.guild, interaction, hit)
 
 
 class AffinityCompareSelect(discord.ui.Select):
@@ -886,18 +887,18 @@ class AffinityCompareSelect(discord.ui.Select):
             for item in parent.affinities[:25]
         ]
         super().__init__(placeholder="Comparer avec…", options=options)
-        self._parent = parent
+        self._hub = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
         other_id = int(self.values[0])
         view = AffinityCompareView(
-            self._parent.cog,
-            self._parent.guild,
-            self._parent.member.id,
+            self._hub.cog,
+            self._hub.guild,
+            self._hub.member.id,
             other_id,
-            affinity=next(a for a in self._parent.affinities if a.user_id == other_id),
-            titles=self._parent.titles,
+            affinity=next(a for a in self._hub.affinities if a.user_id == other_id),
+            titles=self._hub.titles,
         )
         view._interaction = interaction
         view._message = await interaction.followup.send(view=view)
@@ -962,18 +963,18 @@ class FavoriteSlotButton(discord.ui.Button):
             label=label,
             style=discord.ButtonStyle.secondary if filled else discord.ButtonStyle.green,
         )
-        self._parent = parent
+        self._hub = parent
         self._slot = slot
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self._parent.member.id:
+        if interaction.user.id != self._hub.member.id:
             await interaction.response.send_message(
                 "**Action impossible ·** Seul le propriétaire du profil peut modifier ses préférées.",
                 ephemeral=True,
                 delete_after=10,
             )
             return
-        await interaction.response.send_modal(FavoriteSearchModal(self._parent, self._slot))
+        await interaction.response.send_modal(FavoriteSearchModal(self._hub, self._slot))
 
 
 class FavoriteClearSelect(discord.ui.Select):
@@ -987,10 +988,10 @@ class FavoriteClearSelect(discord.ui.Select):
             for slot in filled
         ]
         super().__init__(placeholder="Retirer une préférée…", options=options, min_values=1, max_values=1)
-        self._parent = parent
+        self._hub = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self._parent.member.id:
+        if interaction.user.id != self._hub.member.id:
             await interaction.response.send_message(
                 "**Action impossible ·** Seul le propriétaire du profil peut modifier ses préférées.",
                 ephemeral=True,
@@ -999,8 +1000,8 @@ class FavoriteClearSelect(discord.ui.Select):
             return
         await interaction.response.defer()
         slot = int(self.values[0])
-        await self._parent.cog.clear_favorite(self._parent.guild, self._parent.member.id, slot)
-        await self._parent.refresh(interaction)
+        await self._hub.cog.clear_favorite(self._hub.guild, self._hub.member.id, slot)
+        await self._hub.refresh(interaction)
         await interaction.followup.send(
             f"**Préférée retirée ·** {FAVORITE_LABELS[slot]} est de nouveau vide.",
             ephemeral=True,
@@ -1067,16 +1068,16 @@ class FavoriteHitSelect(discord.ui.Select):
                 )
             )
         super().__init__(placeholder="Choisir une œuvre", options=options, min_values=1, max_values=1)
-        self._parent = parent
+        self._hub = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
-        hit = self._parent.hits[int(self.values[0])]
-        await self._parent.profile.apply_favorite(self._parent.slot, hit)
+        hit = self._hub.hits[int(self.values[0])]
+        await self._hub.profile.apply_favorite(self._hub.slot, hit)
         done = discord.ui.LayoutView(timeout=30)
         box = discord.ui.Container()
         box.add_item(discord.ui.TextDisplay(
-            f"**{FAVORITE_LABELS[self._parent.slot]} ·** {hit.title}"
+            f"**{FAVORITE_LABELS[self._hub.slot]} ·** {hit.title}"
         ))
         done.add_item(box)
         await interaction.edit_original_response(view=done)
@@ -1320,18 +1321,18 @@ class TopPeriodSelect(discord.ui.Select):
             discord.SelectOption(label="Ce mois", value="mois", default=parent.period == "mois"),
         ]
         super().__init__(placeholder="Période du top", options=options, min_values=1, max_values=1)
-        self._parent = parent
+        self._hub = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
-        self._parent.period = self.values[0]
-        self._parent.top_page = 0
-        self._parent.top_items = await self._parent.cog.load_top(
-            self._parent.guild,
-            media_type=self._parent.media_type,
-            period=self._parent.period,
+        self._hub.period = self.values[0]
+        self._hub.top_page = 0
+        self._hub.top_items = await self._hub.cog.load_top(
+            self._hub.guild,
+            media_type=self._hub.media_type,
+            period=self._hub.period,
         )
-        await self._parent.refresh(interaction)
+        await self._hub.refresh(interaction)
 
 
 class ServerHubView(ReviewsLayout):
