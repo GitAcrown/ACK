@@ -31,6 +31,42 @@ logger = logging.getLogger("ACK.Reviews")
 
 NO_PINGS = discord.AllowedMentions.none()
 
+
+async def apply_view(interaction: discord.Interaction, view: discord.ui.LayoutView) -> None:
+    """Met à jour le message comme MARIA : `edit_message`, sans allowed_mentions."""
+    if interaction.response.is_done():
+        await interaction.edit_original_response(view=view)
+    else:
+        await interaction.response.edit_message(view=view)
+
+
+class ReviewsLayout(discord.ui.LayoutView):
+    """LayoutView ACK : corps dans un Container, boutons en ActionRow de premier niveau."""
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        logger.exception("Vue %s / %s : %s", type(self).__name__, type(item).__name__, error)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "**Erreur ·** Action impossible pour le moment.",
+                    ephemeral=True,
+                )
+        except discord.HTTPException:
+            pass
+
+    def set_layout(self, body: list[discord.ui.Item], *rows: discord.ui.ActionRow | None) -> None:
+        self.clear_items()
+        if body:
+            self.add_item(discord.ui.Container(*body))
+        for row in rows:
+            if row is not None:
+                self.add_item(row)
+
 VALID_RATINGS = tuple(i / 2 for i in range(11))
 DEFAULT_COMMENT_MAX = 280
 MIN_COMMENT_MAX = 50
@@ -309,19 +345,18 @@ def _fiche_body(
     return "\n".join(lines)
 
 
-def add_fiche_header(container: discord.ui.Container, hit: MediaHit) -> None:
-    container.add_item(discord.ui.TextDisplay(f"{_title_line(hit)}\n-# {_meta_line(hit)}"))
-    container.add_item(discord.ui.Separator())
-
-
-def add_backdrop(container: discord.ui.Container, hit: MediaHit) -> None:
+def fiche_intro(hit: MediaHit) -> list[discord.ui.Item]:
+    items: list[discord.ui.Item] = [
+        discord.ui.TextDisplay(f"{_title_line(hit)}\n-# {_meta_line(hit)}"),
+        discord.ui.Separator(),
+    ]
     backdrop = hit.extra.get("backdrop_url")
-    if not backdrop:
-        return
-    try:
-        container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(backdrop)))
-    except Exception:
-        pass
+    if backdrop:
+        try:
+            items.append(discord.ui.MediaGallery(discord.MediaGalleryItem(backdrop)))
+        except Exception:
+            pass
+    return items
 
 
 def _link_label(hit: MediaHit) -> str:
@@ -342,7 +377,7 @@ async def open_public_fiche(
     view = MediaSessionView(cog, guild, [hit], author_id=interaction.user.id, ephemeral=False)
     await view.prepare()
     view._interaction = interaction
-    view._message = await interaction.followup.send(view=view, allowed_mentions=NO_PINGS)
+    view._message = await interaction.followup.send(view=view)
 
 
 # ---------------------------------------------------------------------------
@@ -451,10 +486,10 @@ class TabButton(discord.ui.Button):
         self._tab = tab
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer()
         self._parent.tab = self._tab
         self._parent.review_page = 0
-        await self._parent.refresh(interaction)
+        self._parent._build()
+        await apply_view(interaction, self._parent)
 
 
 class RateButton(discord.ui.Button):
@@ -513,7 +548,7 @@ class PublishFicheButton(discord.ui.Button):
         )
         await view.prepare()
         view._interaction = interaction
-        view._message = await interaction.followup.send(view=view, allowed_mentions=NO_PINGS)
+        view._message = await interaction.followup.send(view=view)
 
 
 class HubTabButton(discord.ui.Button):
@@ -526,9 +561,9 @@ class HubTabButton(discord.ui.Button):
         self._tab = tab
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer()
         self._parent.tab = self._tab
-        await self._parent.refresh(interaction)
+        self._parent._build()
+        await apply_view(interaction, self._parent)
 
 
 class HubPageButton(discord.ui.Button):
@@ -540,13 +575,13 @@ class HubPageButton(discord.ui.Button):
         self._max_page = max_page
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer()
         current = getattr(self._parent, self._attr)
         setattr(self._parent, self._attr, max(0, min(self._max_page, current + self._delta)))
-        await self._parent.refresh(interaction)
+        self._parent._build()
+        await apply_view(interaction, self._parent)
 
 
-class MediaSessionView(discord.ui.LayoutView):
+class MediaSessionView(ReviewsLayout):
     """Recherche → fiche → critiques, dans une seule vue interactive."""
 
     def __init__(
@@ -647,32 +682,26 @@ class MediaSessionView(discord.ui.LayoutView):
         await self.cog.announce_review(self.guild, interaction.user, self.hit, rating, comment, updated=not created)
 
     def _build(self) -> None:
-        self.clear_items()
-        container = discord.ui.Container()
         hit = self.hit
+        body: list[discord.ui.Item] = []
+        rows: list[discord.ui.ActionRow] = []
 
         if len(self.hits) > 1:
-            container.add_item(discord.ui.TextDisplay(f"### Résultats · {len(self.hits)} œuvre(s)"))
-            row = discord.ui.ActionRow()
-            row.add_item(MediaSelect(self, self.hits, self.selected))
-            container.add_item(row)
-            if not any(hit.source == "tmdb" for hit in self.hits) and any(
-                hit.source == "spotify" for hit in self.hits
+            body.append(discord.ui.TextDisplay(f"### Résultats · {len(self.hits)} œuvre(s)"))
+            if not any(item.source == "tmdb" for item in self.hits) and any(
+                item.source == "spotify" for item in self.hits
             ):
                 if self.cog.catalog is not None and not self.cog.catalog.tmdb.available:
-                    container.add_item(discord.ui.TextDisplay(
-                        "-# Films et séries absents · clé TMDB manquante."
-                    ))
+                    body.append(discord.ui.TextDisplay("-# Films et séries absents · clé TMDB manquante."))
                 else:
-                    container.add_item(discord.ui.TextDisplay(
+                    body.append(discord.ui.TextDisplay(
                         "-# Aucun film ou série trouvé — précise le type si besoin."
                     ))
-            container.add_item(discord.ui.Separator())
+            rows.append(discord.ui.ActionRow(MediaSelect(self, self.hits, self.selected)))
 
         if self.tab == "fiche":
-            add_fiche_header(container, hit)
-            add_backdrop(container, hit)
-            container.add_item(section_with_thumbnail(
+            body.extend(fiche_intro(hit))
+            body.append(section_with_thumbnail(
                 _fiche_body(
                     hit,
                     avg=self.avg,
@@ -684,12 +713,12 @@ class MediaSessionView(discord.ui.LayoutView):
             ))
             footer = _footer_line(hit)
             if footer:
-                container.add_item(discord.ui.Separator())
-                container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
+                body.append(discord.ui.Separator())
+                body.append(discord.ui.TextDisplay(f"-# {footer}"))
         else:
-            add_fiche_header(container, hit)
+            body.extend(fiche_intro(hit)[:2])
             if not self.reviews:
-                container.add_item(discord.ui.TextDisplay("*Pas encore de critique sur ce serveur.*"))
+                body.append(discord.ui.TextDisplay("*Pas encore de critique sur ce serveur.*"))
             else:
                 start = self.review_page * REVIEWS_PAGE
                 page_rows = self.reviews[start:start + REVIEWS_PAGE]
@@ -703,18 +732,12 @@ class MediaSessionView(discord.ui.LayoutView):
                     )
                     if row["comment"]:
                         text += f"\n{pretty.shorten_text(row['comment'], 220)}"
-                    container.add_item(section_with_thumbnail(text, avatar))
+                    body.append(section_with_thumbnail(text, avatar))
                 total_pages = max(1, (len(self.reviews) + REVIEWS_PAGE - 1) // REVIEWS_PAGE)
-                container.add_item(discord.ui.TextDisplay(
+                body.append(discord.ui.TextDisplay(
                     f"-# {self.count} critique(s) · moyenne {format_stars(self.avg or 0)} {(self.avg or 0):.1f}/5 · page {self.review_page + 1}/{total_pages}"
                 ))
 
-        tabs = discord.ui.ActionRow()
-        tabs.add_item(TabButton(self, "fiche", "Fiche"))
-        tabs.add_item(TabButton(self, "critiques", f"Critiques ({self.count})"))
-        container.add_item(tabs)
-
-        actions = discord.ui.ActionRow()
         rate_label = "Noter"
         if self.ephemeral and self.pending_rating is not None and self.my_review is None:
             rate_label = f"Noter {format_stars_compact(self.pending_rating)}"
@@ -722,38 +745,39 @@ class MediaSessionView(discord.ui.LayoutView):
             rate_label = "Modifier ma note"
         rate_btn = RateButton(self)
         rate_btn.label = rate_label
-        actions.add_item(rate_btn)
+        actions: list[discord.ui.Item] = [rate_btn]
         if self.ephemeral and self.my_review:
-            actions.add_item(DeleteReviewButton(self))
+            actions.append(DeleteReviewButton(self))
         if self.ephemeral:
-            actions.add_item(PublishFicheButton(self))
+            actions.append(PublishFicheButton(self))
         if hit.url:
-            actions.add_item(discord.ui.Button(label=_link_label(hit), url=hit.url, style=discord.ButtonStyle.link))
-        container.add_item(actions)
+            actions.append(discord.ui.Button(label=_link_label(hit), url=hit.url, style=discord.ButtonStyle.link))
 
+        rows.append(discord.ui.ActionRow(
+            TabButton(self, "fiche", "Fiche"),
+            TabButton(self, "critiques", f"Critiques ({self.count})"),
+        ))
+        rows.append(discord.ui.ActionRow(*actions))
         if self.tab == "critiques" and len(self.reviews) > REVIEWS_PAGE:
-            nav = discord.ui.ActionRow()
+            nav_btns: list[discord.ui.Item] = []
             if self.review_page > 0:
-                nav.add_item(_ReviewPageButton(self, -1, "← Précédent"))
+                nav_btns.append(_ReviewPageButton(self, -1, "← Précédent"))
             if (self.review_page + 1) * REVIEWS_PAGE < len(self.reviews):
-                nav.add_item(_ReviewPageButton(self, 1, "Suivant →"))
-            container.add_item(nav)
-
-        self.add_item(container)
+                nav_btns.append(_ReviewPageButton(self, 1, "Suivant →"))
+            if nav_btns:
+                rows.append(discord.ui.ActionRow(*nav_btns))
+        self.set_layout(body, *rows)
 
     async def refresh(self, interaction: discord.Interaction | None = None) -> None:
         await self.reload_stats()
         self._build()
         try:
             if interaction is not None:
-                if interaction.response.is_done():
-                    await interaction.edit_original_response(view=self, allowed_mentions=NO_PINGS)
-                else:
-                    await interaction.response.edit_message(view=self, allowed_mentions=NO_PINGS)
+                await apply_view(interaction, self)
             elif self._message is not None:
-                await self._message.edit(view=self, allowed_mentions=NO_PINGS)
+                await self._message.edit(view=self)
             elif self._interaction is not None:
-                await self._interaction.edit_original_response(view=self, allowed_mentions=NO_PINGS)
+                await self._interaction.edit_original_response(view=self)
         except discord.HTTPException as exc:
             logger.warning("Impossible de rafraîchir la fiche « %s » : %s", self.hit.title, exc)
 
@@ -761,9 +785,9 @@ class MediaSessionView(discord.ui.LayoutView):
         self._interaction = interaction
         await self.prepare()
         if deferred:
-            await interaction.edit_original_response(view=self, allowed_mentions=NO_PINGS)
+            await interaction.edit_original_response(view=self)
         else:
-            await interaction.response.send_message(view=self, ephemeral=self.ephemeral, allowed_mentions=NO_PINGS)
+            await interaction.response.send_message(view=self, ephemeral=self.ephemeral)
 
 
 class _ReviewPageButton(discord.ui.Button):
@@ -773,9 +797,9 @@ class _ReviewPageButton(discord.ui.Button):
         self._delta = delta
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer()
         self._parent.review_page = max(0, self._parent.review_page + self._delta)
-        await self._parent.refresh(interaction)
+        self._parent._build()
+        await apply_view(interaction, self._parent)
 
 
 # ---------------------------------------------------------------------------
@@ -876,10 +900,10 @@ class AffinityCompareSelect(discord.ui.Select):
             titles=self._parent.titles,
         )
         view._interaction = interaction
-        view._message = await interaction.followup.send(view=view, allowed_mentions=NO_PINGS)
+        view._message = await interaction.followup.send(view=view)
 
 
-class AffinityCompareView(discord.ui.LayoutView):
+class AffinityCompareView(ReviewsLayout):
     def __init__(
         self,
         cog: "Reviews",
@@ -908,27 +932,27 @@ class AffinityCompareView(discord.ui.LayoutView):
         )
 
     def _build(self) -> None:
-        self.clear_items()
-        container = discord.ui.Container()
         _left_name, left_avatar = _user_display(self.guild, self.cog.bot, self.left_id)
-        header = (
-            f"{self._person(self.left_id)}\n{self._person(self.right_id)}\n"
-            f"-# {self.affinity.percent:.0f} % d'accord  ·  {self.affinity.overlap} œuvre(s) en commun"
-        )
-        container.add_item(section_with_thumbnail(header, left_avatar))
-        container.add_item(discord.ui.Separator())
-
+        body: list[discord.ui.Item] = [
+            section_with_thumbnail(
+                f"{self._person(self.left_id)}\n{self._person(self.right_id)}\n"
+                f"-# {self.affinity.percent:.0f} % d'accord  ·  {self.affinity.overlap} œuvre(s) en commun",
+                left_avatar,
+            ),
+        ]
         if self.affinity.agreements:
             lines = ["**D'accord**"]
             for title, left, right in self.affinity.agreements:
                 lines.append(f"{format_stars_compact(left)} / {format_stars_compact(right)}  ·  {title}")
-            container.add_item(discord.ui.TextDisplay("\n".join(lines)))
+            body.append(discord.ui.Separator())
+            body.append(discord.ui.TextDisplay("\n".join(lines)))
         if self.affinity.disagreements:
             lines = ["**Désaccord**"]
             for title, left, right in self.affinity.disagreements:
                 lines.append(f"{format_stars_compact(left)} / {format_stars_compact(right)}  ·  {title}")
-            container.add_item(discord.ui.TextDisplay("\n".join(lines)))
-        self.add_item(container)
+            body.append(discord.ui.Separator())
+            body.append(discord.ui.TextDisplay("\n".join(lines)))
+        self.set_layout(body)
 
 
 class FavoriteSlotButton(discord.ui.Button):
@@ -1058,23 +1082,21 @@ class FavoriteHitSelect(discord.ui.Select):
         await interaction.edit_original_response(view=done)
 
 
-class FavoritePickView(discord.ui.LayoutView):
+class FavoritePickView(ReviewsLayout):
     def __init__(self, profile: "ProfileView", slot: int, hits: list[MediaHit]):
         super().__init__(timeout=180)
         self.profile = profile
         self.slot = slot
         self.hits = hits
-        container = discord.ui.Container()
-        container.add_item(discord.ui.TextDisplay(
-            f"## {FAVORITE_LABELS[slot]}\n-# {len(hits)} résultat(s) — choisis l'œuvre à épingler"
-        ))
-        row = discord.ui.ActionRow()
-        row.add_item(FavoriteHitSelect(self, hits))
-        container.add_item(row)
-        self.add_item(container)
+        self.set_layout(
+            [discord.ui.TextDisplay(
+                f"## {FAVORITE_LABELS[slot]}\n-# {len(hits)} résultat(s) — choisis l'œuvre à épingler"
+            )],
+            discord.ui.ActionRow(FavoriteHitSelect(self, hits)),
+        )
 
 
-class ProfileView(discord.ui.LayoutView):
+class ProfileView(ReviewsLayout):
     def __init__(
         self,
         cog: "Reviews",
@@ -1125,27 +1147,24 @@ class ProfileView(discord.ui.LayoutView):
             self.titles.get(user_id, title_for_level(1)),
         )
 
-    def _add_tabs(self, container: discord.ui.Container) -> None:
-        tabs = discord.ui.ActionRow()
-        tabs.add_item(HubTabButton(self, "profil", "Profil"))
-        tabs.add_item(HubTabButton(self, "journal", f"Journal ({self.review_count})"))
-        tabs.add_item(HubTabButton(self, "affinites", "Affinités"))
-        container.add_item(tabs)
+    def _tabs_row(self) -> discord.ui.ActionRow:
+        return discord.ui.ActionRow(
+            HubTabButton(self, "profil", "Profil"),
+            HubTabButton(self, "journal", f"Journal ({self.review_count})"),
+            HubTabButton(self, "affinites", "Affinités"),
+        )
 
-    def _add_page_nav(self, container: discord.ui.Container, attr: str, max_page: int) -> None:
+    def _page_nav(self, attr: str, max_page: int) -> discord.ui.ActionRow | None:
         if max_page <= 0:
-            return
+            return None
         page = getattr(self, attr)
-        nav = discord.ui.ActionRow()
         prev_btn = HubPageButton(self, attr, -1, "← Précédent", max_page)
         next_btn = HubPageButton(self, attr, 1, "Suivant →", max_page)
         prev_btn.disabled = page <= 0
         next_btn.disabled = page >= max_page
-        nav.add_item(prev_btn)
-        nav.add_item(next_btn)
-        container.add_item(nav)
+        return discord.ui.ActionRow(prev_btn, next_btn)
 
-    def _build_profil(self, container: discord.ui.Container) -> None:
+    def _profil_layout(self) -> tuple[list[discord.ui.Item], list[discord.ui.ActionRow]]:
         level, into, need, total = level_progress(self.xp)
         title = title_for_level(level)
         stats = f"**{self.review_count}** note{'s' if self.review_count != 1 else ''}"
@@ -1160,17 +1179,15 @@ class ProfileView(discord.ui.LayoutView):
             f"{stats}"
         )
         avatar = self.member.display_avatar.url if hasattr(self.member, "display_avatar") else None
-        container.add_item(section_with_thumbnail(header, avatar))
-        container.add_item(discord.ui.Separator())
+        body: list[discord.ui.Item] = [section_with_thumbnail(header, avatar)]
         for index, (slot, label) in enumerate(FAVORITE_LABELS.items()):
-            if index:
-                container.add_item(discord.ui.Separator())
+            body.append(discord.ui.Separator())
             entry = self.favorites[slot - 1] if slot - 1 < len(self.favorites) else None
             if entry is None:
                 hint = "*Pas encore choisi.*"
                 if self.editable:
                     hint += "\n-# Appuie sur le bouton pour en épingler une."
-                container.add_item(discord.ui.TextDisplay(f"### {label}\n{hint}"))
+                body.append(discord.ui.TextDisplay(f"### {label}\n{hint}"))
             else:
                 hit, rating = entry
                 year = f"  ·  {hit.year}" if hit.year else ""
@@ -1182,23 +1199,22 @@ class ProfileView(discord.ui.LayoutView):
                 ]
                 if rating is not None:
                     lines.append(f"{format_stars(rating)}  **{rating:g}/5**")
-                container.add_item(section_with_thumbnail("\n".join(lines), hit.poster_url))
+                body.append(section_with_thumbnail("\n".join(lines), hit.poster_url))
+        rows: list[discord.ui.ActionRow] = []
         if self.editable:
-            actions = discord.ui.ActionRow()
-            for slot in FAVORITE_LABELS:
-                filled = bool(self.favorites[slot - 1] if slot - 1 < len(self.favorites) else None)
-                actions.add_item(FavoriteSlotButton(self, slot, filled))
-            container.add_item(actions)
+            rows.append(discord.ui.ActionRow(*[
+                FavoriteSlotButton(self, slot, bool(self.favorites[slot - 1] if slot - 1 < len(self.favorites) else None))
+                for slot in FAVORITE_LABELS
+            ]))
             filled_slots = [
                 slot for slot in FAVORITE_LABELS
                 if slot - 1 < len(self.favorites) and self.favorites[slot - 1] is not None
             ]
             if filled_slots:
-                clear_row = discord.ui.ActionRow()
-                clear_row.add_item(FavoriteClearSelect(self, filled_slots))
-                container.add_item(clear_row)
+                rows.append(discord.ui.ActionRow(FavoriteClearSelect(self, filled_slots)))
+        return body, rows
 
-    def _build_journal(self, container: discord.ui.Container) -> None:
+    def _journal_layout(self) -> tuple[list[discord.ui.Item], list[discord.ui.ActionRow]]:
         stats = f"{len(self.journal_entries)} note{'s' if len(self.journal_entries) != 1 else ''}"
         if self.average is not None:
             stats += f"  ·  moyenne {format_stars(self.average)} {self.average:.1f}/5"
@@ -1208,12 +1224,15 @@ class ProfileView(discord.ui.LayoutView):
         if types:
             top_type = max(types, key=types.get)
             stats += f"  ·  {types[top_type]} {type_label(top_type).lower()}{'s' if types[top_type] > 1 else ''}"
-        container.add_item(discord.ui.TextDisplay(
-            f"## {pretty.shorten_text(self._display_name(), 80)}\n-# Journal · {stats}"
-        ))
+        body: list[discord.ui.Item] = [
+            discord.ui.TextDisplay(
+                f"## {pretty.shorten_text(self._display_name(), 80)}\n-# Journal · {stats}"
+            )
+        ]
+        rows: list[discord.ui.ActionRow] = []
         if not self.journal_entries:
-            container.add_item(discord.ui.TextDisplay("*Aucune œuvre notée pour l'instant.*"))
-            return
+            body.append(discord.ui.TextDisplay("*Aucune œuvre notée pour l'instant.*"))
+            return body, rows
         max_page = max(0, (len(self.journal_entries) - 1) // JOURNAL_PAGE)
         self.journal_page = min(self.journal_page, max_page)
         start = self.journal_page * JOURNAL_PAGE
@@ -1223,23 +1242,25 @@ class ProfileView(discord.ui.LayoutView):
             text = f"{format_stars(row['rating'])}  **{hit.title}**{year}\n-# {type_label(hit.media_type)}"
             if row["comment"]:
                 text += f"\n{pretty.shorten_text(row['comment'], 180)}"
-            container.add_item(section_with_thumbnail(text, hit.poster_url))
-        select_row = discord.ui.ActionRow()
-        select_row.add_item(JournalOpenSelect(self, page_items))
-        container.add_item(select_row)
-        self._add_page_nav(container, "journal_page", max_page)
+            body.append(section_with_thumbnail(text, hit.poster_url))
+        rows.append(discord.ui.ActionRow(JournalOpenSelect(self, page_items)))
+        nav = self._page_nav("journal_page", max_page)
+        if nav:
+            rows.append(nav)
+        return body, rows
 
-    def _build_affinites(self, container: discord.ui.Container) -> None:
+    def _affinites_layout(self) -> tuple[list[discord.ui.Item], list[discord.ui.ActionRow]]:
         _me, avatar = _user_display(self.guild, self.cog.bot, self.member.id)
+        rows: list[discord.ui.ActionRow] = []
         if not self.affinities:
-            container.add_item(section_with_thumbnail(
+            body = [section_with_thumbnail(
                 f"## {pretty.shorten_text(self._display_name(), 80)}\n"
                 f"{self._person(self.member.id)}\n"
                 f"*Pas encore assez d'œuvres en commun avec quelqu'un "
                 f"(minimum {MIN_AFFINITY_OVERLAP}).*",
                 avatar,
-            ))
-            return
+            )]
+            return body, rows
         twins = self.affinities[:3]
         rival = min(self.affinities, key=lambda a: (a.percent, -a.overlap))
         lines = [
@@ -1257,22 +1278,18 @@ class ProfileView(discord.ui.LayoutView):
             lines.append(f"### {RIVAL} Rival")
             lines.append(self._person(rival.user_id))
             lines.append(f"-# {rival.percent:.0f} %")
-        container.add_item(section_with_thumbnail("\n".join(lines), avatar))
-        select_row = discord.ui.ActionRow()
-        select_row.add_item(AffinityCompareSelect(self))
-        container.add_item(select_row)
+        body = [section_with_thumbnail("\n".join(lines), avatar)]
+        rows.append(discord.ui.ActionRow(AffinityCompareSelect(self)))
+        return body, rows
 
     def _build(self) -> None:
-        self.clear_items()
-        container = discord.ui.Container()
         if self.tab == "journal":
-            self._build_journal(container)
+            body, rows = self._journal_layout()
         elif self.tab == "affinites":
-            self._build_affinites(container)
+            body, rows = self._affinites_layout()
         else:
-            self._build_profil(container)
-        self._add_tabs(container)
-        self.add_item(container)
+            body, rows = self._profil_layout()
+        self.set_layout(body, *rows, self._tabs_row())
 
     async def apply_favorite(self, slot: int, hit: MediaHit) -> None:
         if self.cog.catalog is not None:
@@ -1290,10 +1307,7 @@ class ProfileView(discord.ui.LayoutView):
         if editor is None:
             return
         try:
-            if editor.response.is_done():
-                await editor.edit_original_response(view=self, allowed_mentions=NO_PINGS)
-            else:
-                await editor.response.edit_message(view=self, allowed_mentions=NO_PINGS)
+            await apply_view(editor, self)
         except discord.HTTPException as exc:
             logger.warning("Impossible de rafraîchir le profil : %s", exc)
 
@@ -1320,7 +1334,7 @@ class TopPeriodSelect(discord.ui.Select):
         await self._parent.refresh(interaction)
 
 
-class ServerHubView(discord.ui.LayoutView):
+class ServerHubView(ReviewsLayout):
     """Récentes, catalogue et top du serveur, dans une seule vue à onglets."""
 
     def __init__(
@@ -1354,42 +1368,39 @@ class ServerHubView(discord.ui.LayoutView):
         self._interaction: discord.Interaction | None = None
         self._build()
 
-    def _add_tabs(self, container: discord.ui.Container) -> None:
-        tabs = discord.ui.ActionRow()
-        tabs.add_item(HubTabButton(self, "recentes", "Récentes"))
-        tabs.add_item(HubTabButton(self, "catalogue", f"Catalogue ({len(self.catalog)})"))
-        tabs.add_item(HubTabButton(self, "top", "Top"))
-        container.add_item(tabs)
+    def _tabs_row(self) -> discord.ui.ActionRow:
+        return discord.ui.ActionRow(
+            HubTabButton(self, "recentes", "Récentes"),
+            HubTabButton(self, "catalogue", f"Catalogue ({len(self.catalog)})"),
+            HubTabButton(self, "top", "Top"),
+        )
 
-    def _add_page_nav(self, container: discord.ui.Container, attr: str, max_page: int) -> None:
+    def _page_nav(self, attr: str, max_page: int) -> discord.ui.ActionRow | None:
         if max_page <= 0:
-            return
+            return None
         page = getattr(self, attr)
-        nav = discord.ui.ActionRow()
         prev_btn = HubPageButton(self, attr, -1, "← Précédent", max_page)
         next_btn = HubPageButton(self, attr, 1, "Suivant →", max_page)
         prev_btn.disabled = page <= 0
         next_btn.disabled = page >= max_page
-        nav.add_item(prev_btn)
-        nav.add_item(next_btn)
-        container.add_item(nav)
+        return discord.ui.ActionRow(prev_btn, next_btn)
 
-    def _build_ranked(
+    def _ranked_layout(
         self,
-        container: discord.ui.Container,
         *,
         title: str,
         subtitle: str,
         items: list[tuple[MediaHit, float, int]],
         page_attr: str,
         extra_row: discord.ui.ActionRow | None = None,
-    ) -> None:
-        container.add_item(discord.ui.TextDisplay(f"## {title}\n-# {subtitle}"))
+    ) -> tuple[list[discord.ui.Item], list[discord.ui.ActionRow]]:
+        body: list[discord.ui.Item] = [discord.ui.TextDisplay(f"## {title}\n-# {subtitle}")]
+        rows: list[discord.ui.ActionRow] = []
+        if extra_row:
+            rows.append(extra_row)
         if not items:
-            container.add_item(discord.ui.TextDisplay("*Aucune œuvre ne correspond à cette recherche.*"))
-            if extra_row:
-                container.add_item(extra_row)
-            return
+            body.append(discord.ui.TextDisplay("*Aucune œuvre ne correspond à cette recherche.*"))
+            return body, rows
         max_page = max(0, (len(items) - 1) // CATALOG_PAGE)
         page = min(getattr(self, page_attr), max_page)
         setattr(self, page_attr, page)
@@ -1402,21 +1413,21 @@ class ServerHubView(discord.ui.LayoutView):
                 f"**{index}.** {format_stars(avg)}  **{hit.title}**{year}  ·  "
                 f"{type_label(hit.media_type)}  ·  {count} note{'s' if count > 1 else ''}"
             )
-        container.add_item(discord.ui.TextDisplay("\n".join(lines)))
-        select_row = discord.ui.ActionRow()
-        select_row.add_item(CatalogOpenSelect(self, page_items))
-        container.add_item(select_row)
-        if extra_row:
-            container.add_item(extra_row)
-        self._add_page_nav(container, page_attr, max_page)
+        body.append(discord.ui.TextDisplay("\n".join(lines)))
+        rows.append(discord.ui.ActionRow(CatalogOpenSelect(self, page_items)))
+        nav = self._page_nav(page_attr, max_page)
+        if nav:
+            rows.append(nav)
+        return body, rows
 
-    def _build_recentes(self, container: discord.ui.Container) -> None:
-        container.add_item(discord.ui.TextDisplay(
+    def _recentes_layout(self) -> tuple[list[discord.ui.Item], list[discord.ui.ActionRow]]:
+        body: list[discord.ui.Item] = [discord.ui.TextDisplay(
             f"## Dernières critiques\n-# {len(self.recent)} récente(s) sur ce serveur"
-        ))
+        )]
+        rows: list[discord.ui.ActionRow] = []
         if not self.recent:
-            container.add_item(discord.ui.TextDisplay("*Personne n'a encore noté d'œuvre ici.*"))
-            return
+            body.append(discord.ui.TextDisplay("*Personne n'a encore noté d'œuvre ici.*"))
+            return body, rows
         max_page = max(0, (len(self.recent) - 1) // JOURNAL_PAGE)
         self.recent_page = min(self.recent_page, max_page)
         start = self.recent_page * JOURNAL_PAGE
@@ -1432,18 +1443,16 @@ class ServerHubView(discord.ui.LayoutView):
             )
             if row["comment"]:
                 text += f"\n*{pretty.shorten_text(row['comment'], 180)}*"
-            container.add_item(section_with_thumbnail(text, avatar or hit.poster_url))
-        select_row = discord.ui.ActionRow()
-        select_row.add_item(RecentOpenSelect(self, page_items))
-        container.add_item(select_row)
-        self._add_page_nav(container, "recent_page", max_page)
+            body.append(section_with_thumbnail(text, avatar or hit.poster_url))
+        rows.append(discord.ui.ActionRow(RecentOpenSelect(self, page_items)))
+        nav = self._page_nav("recent_page", max_page)
+        if nav:
+            rows.append(nav)
+        return body, rows
 
     def _build(self) -> None:
-        self.clear_items()
-        container = discord.ui.Container()
         if self.tab == "catalogue":
-            self._build_ranked(
-                container,
+            body, rows = self._ranked_layout(
                 title="Catalogue du serveur",
                 subtitle=self.catalog_subtitle,
                 items=self.catalog,
@@ -1454,20 +1463,16 @@ class ServerHubView(discord.ui.LayoutView):
                 self.period, self.period
             )
             type_part = type_label(self.media_type) if self.media_type != "all" else "Tous types"
-            period_row = discord.ui.ActionRow()
-            period_row.add_item(TopPeriodSelect(self))
-            self._build_ranked(
-                container,
+            body, rows = self._ranked_layout(
                 title="Top du serveur",
                 subtitle=f"{type_part}  ·  {period_label}",
                 items=self.top_items,
                 page_attr="top_page",
-                extra_row=period_row,
+                extra_row=discord.ui.ActionRow(TopPeriodSelect(self)),
             )
         else:
-            self._build_recentes(container)
-        self._add_tabs(container)
-        self.add_item(container)
+            body, rows = self._recentes_layout()
+        self.set_layout(body, *rows, self._tabs_row())
 
     async def refresh(self, interaction: discord.Interaction | None = None) -> None:
         self._build()
@@ -1475,10 +1480,7 @@ class ServerHubView(discord.ui.LayoutView):
         if editor is None:
             return
         try:
-            if editor.response.is_done():
-                await editor.edit_original_response(view=self, allowed_mentions=NO_PINGS)
-            else:
-                await editor.response.edit_message(view=self, allowed_mentions=NO_PINGS)
+            await apply_view(editor, self)
         except discord.HTTPException as exc:
             logger.warning("Impossible de rafraîchir l'explorateur : %s", exc)
 
@@ -1509,7 +1511,7 @@ class CommentMaxModal(discord.ui.Modal, title="Longueur max. du commentaire"):
             )
             return
         await self._view_ref.cog.data.get(self._view_ref.guild).set_dict_value("settings", "MaxCommentLength", int(raw))
-        await self._view_ref.refresh()
+        await self._view_ref.refresh(interaction)
 
 
 class EditCommentMaxButton(discord.ui.Button):
@@ -1537,7 +1539,7 @@ class ToggleAnnounceButton(discord.ui.Button):
         if self._view_ref.announce_channel is not None:
             await settings.set_dict_value("settings", "LastAnnounceChannelID", self._view_ref.announce_channel.id)
             await settings.set_dict_value("settings", "AnnounceChannelID", 0)
-            await self._view_ref.refresh()
+            await self._view_ref.refresh(interaction)
             return
         last_id = await settings.get_dict_value("settings", "LastAnnounceChannelID", cast=int)
         channel = guild.get_channel(last_id) if last_id else None
@@ -1552,7 +1554,7 @@ class ToggleAnnounceButton(discord.ui.Button):
             )
             return
         await settings.set_dict_value("settings", "AnnounceChannelID", channel.id)
-        await self._view_ref.refresh()
+        await self._view_ref.refresh(interaction)
 
 
 class AnnounceChannelSelect(discord.ui.ChannelSelect):
@@ -1574,7 +1576,7 @@ class AnnounceChannelSelect(discord.ui.ChannelSelect):
                     "settings", "LastAnnounceChannelID", self._view_ref.announce_channel.id
                 )
             await cog.data.get(guild).set_dict_value("settings", "AnnounceChannelID", 0)
-            await self._view_ref.refresh()
+            await self._view_ref.refresh(interaction)
             return
         channel = self.values[0].resolve()
         if channel is None:
@@ -1594,10 +1596,10 @@ class AnnounceChannelSelect(discord.ui.ChannelSelect):
             )
             return
         await cog.data.get(guild).set_dict_value("settings", "AnnounceChannelID", channel.id)
-        await self._view_ref.refresh()
+        await self._view_ref.refresh(interaction)
 
 
-class ReviewsConfigView(discord.ui.LayoutView):
+class ReviewsConfigView(ReviewsLayout):
     def __init__(
         self,
         cog: "Reviews",
@@ -1629,44 +1631,40 @@ class ReviewsConfigView(discord.ui.LayoutView):
         return True
 
     def _build(self) -> None:
-        self.clear_items()
-        container = discord.ui.Container()
-        container.add_item(discord.ui.TextDisplay(f"## Configuration des critiques — {self.guild.name}"))
-        container.add_item(discord.ui.Separator())
-        container.add_item(
-            discord.ui.Section(
-                f"**Salon d'annonce**\n{self.announce_channel.mention if self.announce_channel else '*Non configuré*'}",
-                accessory=ToggleAnnounceButton(self),
-            )
-        )
-        channel_row = discord.ui.ActionRow()
-        channel_row.add_item(AnnounceChannelSelect(self))
-        container.add_item(channel_row)
-        container.add_item(discord.ui.Separator())
-        container.add_item(
-            discord.ui.Section(
-                f"**Commentaire max.**\n{self.comment_max} caractères",
-                accessory=EditCommentMaxButton(self),
-            )
-        )
-        container.add_item(discord.ui.Separator())
         apis = "  ·  ".join(f"{name} {'ok' if ok else 'manquant'}" for name, ok in self.api_status.items())
-        container.add_item(discord.ui.TextDisplay(
-            f"-# {self.review_count} critique(s) · {self.media_count} œuvre(s)\n-# APIs · {apis}"
-        ))
-        self.add_item(container)
+        self.set_layout(
+            [
+                discord.ui.TextDisplay(f"## Configuration des critiques — {self.guild.name}"),
+                discord.ui.Separator(),
+                discord.ui.Section(
+                    f"**Salon d'annonce**\n{self.announce_channel.mention if self.announce_channel else '*Non configuré*'}",
+                    accessory=ToggleAnnounceButton(self),
+                ),
+                discord.ui.Separator(),
+                discord.ui.Section(
+                    f"**Commentaire max.**\n{self.comment_max} caractères",
+                    accessory=EditCommentMaxButton(self),
+                ),
+                discord.ui.Separator(),
+                discord.ui.TextDisplay(
+                    f"-# {self.review_count} critique(s) · {self.media_count} œuvre(s)\n-# APIs · {apis}"
+                ),
+            ],
+            discord.ui.ActionRow(AnnounceChannelSelect(self)),
+        )
 
     async def _reload(self) -> None:
         self.announce_channel = await self.cog.get_announce_channel(self.guild)
         self.comment_max = await self.cog.get_comment_max(self.guild)
         self.review_count, self.media_count = await self.cog.counts(self.guild)
-        self.api_status = self.cog.catalog.status()
+        self.api_status = self.cog.catalog.status() if self.cog.catalog else {}
 
-    async def refresh(self) -> None:
+    async def refresh(self, interaction: discord.Interaction | None = None) -> None:
         await self._reload()
         self._build()
-        if self._interaction:
-            await self._interaction.edit_original_response(view=self)
+        editor = interaction or self._interaction
+        if editor is not None:
+            await apply_view(editor, self)
 
     async def start(self, interaction: discord.Interaction) -> None:
         self._interaction = interaction
@@ -2449,7 +2447,7 @@ class Reviews(commands.Cog):
             editable=target.id == interaction.user.id,
         )
         view._interaction = interaction
-        await interaction.edit_original_response(view=view, allowed_mentions=NO_PINGS)
+        await interaction.edit_original_response(view=view)
 
     @critique_group.command(name="search")
     @app_commands.rename(query="recherche", member="membre", media_type="type", min_rating="note_min")
@@ -2507,7 +2505,7 @@ class Reviews(commands.Cog):
             tab="catalogue" if filtered else "recentes",
         )
         view._interaction = interaction
-        await interaction.edit_original_response(view=view, allowed_mentions=NO_PINGS)
+        await interaction.edit_original_response(view=view)
 
     @app_commands.command(name="critiqueconfig")
     @app_commands.guild_only()
