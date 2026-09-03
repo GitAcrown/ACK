@@ -36,7 +36,7 @@ from .progress import (
     level_progress,
     title_for_level,
 )
-from .providers import MediaCatalog, MediaHit
+from .providers import MediaCatalog, MediaHit, parse_search_query
 from utils import dataio, fuzzy, pretty
 
 logger = logging.getLogger("ACK.Reviews")
@@ -2508,16 +2508,24 @@ class Reviews(commands.Cog):
         query: str,
         media_type: str,
     ) -> list[MediaHit] | None:
-        if len(query.strip()) < 2:
+        spec = parse_search_query(query)
+        if not spec.lookup_id and len(spec.query.strip()) < 2:
             await interaction.edit_original_response(content="**Erreur ·** La recherche doit contenir au moins 2 caractères.")
             return None
         if self.catalog is None:
             await interaction.edit_original_response(content="**Erreur ·** Catalogue média indisponible.")
             return None
-        if media_type in ("movie", "tv") and not self.catalog.tmdb.available:
+        wants_tmdb = spec.source in (None, "tmdb") and (
+            spec.lookup_id or media_type in ("all", "movie", "tv") or spec.media_type in ("movie", "tv")
+        )
+        if wants_tmdb and spec.source == "tmdb" and not self.catalog.tmdb.available:
             await interaction.edit_original_response(content="**Erreur ·** Clé TMDB manquante (`TMDB_API_KEY` dans `.env`).")
             return None
-        if media_type in ("album", "track") and not self.catalog.spotify.available:
+        if media_type in ("movie", "tv") and spec.source is None and not self.catalog.tmdb.available:
+            await interaction.edit_original_response(content="**Erreur ·** Clé TMDB manquante (`TMDB_API_KEY` dans `.env`).")
+            return None
+        wants_spotify = spec.source == "spotify" or (spec.source is None and media_type in ("album", "track"))
+        if wants_spotify and not self.catalog.spotify.available:
             await interaction.edit_original_response(
                 content="**Erreur ·** Clés Spotify manquantes (`SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` dans `.env`)."
             )
@@ -2543,7 +2551,7 @@ class Reviews(commands.Cog):
     @critique_group.command(name="note")
     @app_commands.rename(query="recherche", media_type="type", rating="note", comment="commentaire")
     @app_commands.describe(
-        query="Titre de l'œuvre (ajoute l'année si besoin, ex. Dune 2021)",
+        query="Titre, année, ou préfixe (tmdb:Dune, tmdb:27205, URL TMDB)",
         media_type="Restreindre la recherche à un type de média",
         rating="Note de 0 à 5 (demies étoiles autorisées)",
         comment="Court commentaire optionnel",
@@ -2580,7 +2588,7 @@ class Reviews(commands.Cog):
 
     @critique_group.command(name="fiche")
     @app_commands.rename(query="recherche", media_type="type")
-    @app_commands.describe(query="Titre de l'œuvre", media_type="Type de média")
+    @app_commands.describe(query="Titre, tmdb:Dune, tmdb:27205, ou une URL", media_type="Type de média")
     @app_commands.choices(media_type=TYPE_CHOICES)
     async def critique_fiche(
         self,

@@ -37,6 +37,42 @@ OPENLIB_COVER = "https://covers.openlibrary.org/b/id/{}-M.jpg"
 OPENLIB_WORK = "https://openlibrary.org{}"
 
 _YEAR_RE = re.compile(r"\s*[\(\[]?(19\d{2}|20\d{2})[\)\]]?\s*$")
+_PREFIX_RE = re.compile(r"^([^\s:/]+)\s*:\s*(.+)$")
+_TMDB_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:themoviedb\.org|tmdb\.org)/(movie|tv)/(\d+)",
+    re.I,
+)
+_TMDB_PATH_RE = re.compile(r"^(movie|tv|film|serie|série)\s*/\s*(\d+)$", re.I)
+_IMDB_RE = re.compile(r"(?:https?://)?(?:www\.)?imdb\.com/title/(tt\d+)|^(tt\d{5,})$", re.I)
+_STEAM_URL_RE = re.compile(r"(?:https?://)?store\.steampowered\.com/app/(\d+)", re.I)
+_SPOTIFY_URL_RE = re.compile(
+    r"(?:https?://)?open\.spotify\.com/(album|track)/([A-Za-z0-9]+)|spotify:(album|track):([A-Za-z0-9]+)",
+    re.I,
+)
+_SPOTIFY_ID_RE = re.compile(r"^[A-Za-z0-9]{22}$")
+_SOURCE_ALIASES: dict[str, tuple[str, str | None]] = {
+    "tmdb": ("tmdb", None),
+    "themoviedb": ("tmdb", None),
+    "imdb": ("tmdb", None),
+    "steam": ("steam", "game"),
+    "spotify": ("spotify", None),
+    "openlibrary": ("openlibrary", "book"),
+    "ol": ("openlibrary", "book"),
+    "isbn": ("openlibrary", "book"),
+    "movie": ("tmdb", "movie"),
+    "film": ("tmdb", "movie"),
+    "tv": ("tmdb", "tv"),
+    "serie": ("tmdb", "tv"),
+    "série": ("tmdb", "tv"),
+    "show": ("tmdb", "tv"),
+    "game": ("steam", "game"),
+    "jeu": ("steam", "game"),
+    "album": ("spotify", "album"),
+    "track": ("spotify", "track"),
+    "morceau": ("spotify", "track"),
+    "book": ("openlibrary", "book"),
+    "livre": ("openlibrary", "book"),
+}
 _TOKEN_SAFETY_MARGIN = 60
 _LOW_PRIORITY_MARKERS = (
     "karaoke", "made famous", "tribute", "in the style of",
@@ -74,12 +110,116 @@ class MediaHit:
         return (self.source, self.source_id, self.media_type)
 
 
+@dataclass
+class SearchSpec:
+    query: str
+    source: str | None = None
+    media_type: str | None = None
+    lookup_id: str | None = None
+    lookup_kind: str | None = None
+
+
 def parse_query_year(query: str) -> tuple[str, int | None]:
     match = _YEAR_RE.search(query)
     if not match:
         return query.strip(), None
     cleaned = query[: match.start()].strip()
     return cleaned or query.strip(), int(match.group(1))
+
+
+def parse_search_query(raw: str) -> SearchSpec:
+    """Préfixes avancés : `tmdb:Dune`, `tmdb:27205`, URL TMDB / Steam / Spotify."""
+    text = (raw or "").strip()
+    if not text:
+        return SearchSpec(query="")
+
+    tmdb_url = _TMDB_URL_RE.search(text)
+    if tmdb_url:
+        return SearchSpec(query="", source="tmdb", media_type=tmdb_url.group(1).lower(), lookup_id=tmdb_url.group(2), lookup_kind=tmdb_url.group(1).lower())
+
+    steam_url = _STEAM_URL_RE.search(text)
+    if steam_url:
+        return SearchSpec(query="", source="steam", media_type="game", lookup_id=steam_url.group(1), lookup_kind="game")
+
+    spotify_url = _SPOTIFY_URL_RE.search(text)
+    if spotify_url:
+        kind = (spotify_url.group(1) or spotify_url.group(3) or "").lower()
+        sid = spotify_url.group(2) or spotify_url.group(4) or ""
+        return SearchSpec(query="", source="spotify", media_type=kind, lookup_id=sid, lookup_kind=kind)
+
+    imdb = _IMDB_RE.search(text)
+    if imdb:
+        imdb_id = imdb.group(1) or imdb.group(2)
+        return SearchSpec(query="", source="tmdb", lookup_id=imdb_id, lookup_kind="imdb")
+
+    prefix = _PREFIX_RE.match(text)
+    if not prefix:
+        return SearchSpec(query=text)
+
+    alias = prefix.group(1).strip().casefold()
+    rest = prefix.group(2).strip()
+    mapped = _SOURCE_ALIASES.get(alias)
+    if mapped is None or not rest:
+        return SearchSpec(query=text)
+    source, media_type = mapped
+    spec = SearchSpec(query=rest, source=source, media_type=media_type)
+
+    if source == "tmdb":
+        path = _TMDB_PATH_RE.match(rest)
+        if path:
+            kind = path.group(1).lower()
+            if kind == "film":
+                kind = "movie"
+            elif kind in ("serie", "série"):
+                kind = "tv"
+            spec.query = ""
+            spec.lookup_id = path.group(2)
+            spec.lookup_kind = kind
+            spec.media_type = kind
+            return spec
+        if rest.isdigit():
+            spec.query = ""
+            spec.lookup_id = rest
+            return spec
+        if rest.lower().startswith("tt") and rest[2:].isdigit():
+            spec.query = ""
+            spec.lookup_id = rest
+            spec.lookup_kind = "imdb"
+            return spec
+        if alias == "imdb":
+            spec.query = ""
+            spec.lookup_id = rest if rest.lower().startswith("tt") else f"tt{rest}"
+            spec.lookup_kind = "imdb"
+            return spec
+        return spec
+
+    if source == "steam" and rest.isdigit():
+        spec.query = ""
+        spec.lookup_id = rest
+        spec.lookup_kind = "game"
+        return spec
+
+    if source == "spotify":
+        uri = _SPOTIFY_URL_RE.match(rest)
+        if uri:
+            kind = (uri.group(1) or uri.group(3) or media_type or "").lower()
+            spec.query = ""
+            spec.lookup_id = uri.group(2) or uri.group(4)
+            spec.lookup_kind = kind
+            spec.media_type = kind or spec.media_type
+            return spec
+        path = re.match(r"^(album|track)\s*[/:]\s*([A-Za-z0-9]{22})$", rest, re.I)
+        if path:
+            spec.query = ""
+            spec.lookup_id = path.group(2)
+            spec.lookup_kind = path.group(1).lower()
+            spec.media_type = spec.lookup_kind
+            return spec
+        if _SPOTIFY_ID_RE.match(rest):
+            spec.query = ""
+            spec.lookup_id = rest
+            return spec
+    return spec
 
 
 def _poster(path: str | None) -> str | None:
@@ -185,6 +325,60 @@ class TMDBClient:
 
         results.sort(key=rank, reverse=True)
         hits = [self._from_search(item) for item in results[:limit]]
+        await self._attach_people(hits)
+        return hits
+
+    async def lookup(self, tmdb_id: str, media_type: str | None = None) -> list[MediaHit]:
+        if not self.available:
+            return []
+        kinds = [media_type] if media_type in ("movie", "tv") else ["movie", "tv"]
+
+        async def one(kind: str) -> MediaHit | None:
+            try:
+                payload = await _json(
+                    self.session,
+                    f"{TMDB_BASE}/{kind}/{tmdb_id}",
+                    params={
+                        "api_key": self.api_key,
+                        "language": "fr-FR",
+                        "append_to_response": "credits",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=8),
+                )
+            except aiohttp.ClientResponseError as exc:
+                if exc.status != 404:
+                    logger.warning("Lookup TMDB %s/%s : HTTP %s", kind, tmdb_id, exc.status)
+                return None
+            except Exception as exc:
+                logger.warning("Lookup TMDB %s/%s : %s", kind, tmdb_id, exc)
+                return None
+            hit = self._from_search({**payload, "media_type": kind, "id": payload.get("id") or tmdb_id})
+            return self._from_details(hit, payload)
+
+        found = await asyncio.gather(*(one(kind) for kind in kinds))
+        return [hit for hit in found if hit is not None]
+
+    async def find_imdb(self, imdb_id: str) -> list[MediaHit]:
+        if not self.available:
+            return []
+        try:
+            payload = await _json(
+                self.session,
+                f"{TMDB_BASE}/find/{imdb_id}",
+                params={
+                    "api_key": self.api_key,
+                    "language": "fr-FR",
+                    "external_source": "imdb_id",
+                },
+                timeout=aiohttp.ClientTimeout(total=8),
+            )
+        except Exception as exc:
+            logger.warning("Find IMDb %s : %s", imdb_id, exc)
+            return []
+        hits: list[MediaHit] = []
+        for kind, key in (("movie", "movie_results"), ("tv", "tv_results")):
+            for item in payload.get(key) or []:
+                hits.append(self._from_search({**item, "media_type": kind}))
         await self._attach_people(hits)
         return hits
 
@@ -343,6 +537,20 @@ class SteamClient:
                 break
         return hits
 
+    async def lookup(self, appid: str) -> list[MediaHit]:
+        hit = MediaHit(
+            source="steam",
+            source_id=str(appid),
+            media_type="game",
+            title="?",
+            poster_url=STEAM_HEADER.format(appid),
+            url=STEAM_STORE.format(appid),
+        )
+        hit = await self.enrich(hit)
+        if hit.title == "?" and not hit.overview:
+            return []
+        return [hit]
+
     async def enrich(self, hit: MediaHit) -> MediaHit:
         try:
             payload = await _json(
@@ -467,6 +675,35 @@ class SpotifyClient:
         items = (payload.get("tracks") or {}).get("items") or []
         ranked = self._rank_tracks(items, query)
         return [self._from_track(item) for item in ranked[:limit]]
+
+    async def lookup(self, spotify_id: str, media_type: str | None = None) -> list[MediaHit]:
+        token = await self._token_value()
+        if not token:
+            return []
+        kinds = [media_type] if media_type in ("album", "track") else ["track", "album"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async def one(kind: str) -> MediaHit | None:
+            path = "albums" if kind == "album" else "tracks"
+            try:
+                payload = await _json(
+                    self.session,
+                    f"https://api.spotify.com/v1/{path}/{spotify_id}",
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=8),
+                )
+            except aiohttp.ClientResponseError as exc:
+                if exc.status == 401:
+                    self._token = None
+                return None
+            except Exception:
+                return None
+            if kind == "album":
+                return self._from_album(payload)
+            return self._from_track(payload)
+
+        found = await asyncio.gather(*(one(kind) for kind in kinds))
+        return [hit for hit in found if hit is not None]
 
     def _rank_tracks(self, items: list[dict], query: str) -> list[dict]:
         q = query.strip().casefold()
@@ -596,24 +833,35 @@ class MediaCatalog:
         }
 
     async def search(self, query: str, media_type: str) -> list[MediaHit]:
-        wide = media_type == "all"
+        spec = parse_search_query(query)
+        effective = spec.media_type or (None if media_type == "all" else media_type)
+        if spec.lookup_id:
+            return await self._lookup(spec, effective)
+
+        text = spec.query.strip()
+        if len(text) < 2:
+            return []
+        source = spec.source
+        wide = effective is None
         per = 4 if wide else 8
-        clean, _year = parse_query_year(query)
+        clean, _year = parse_query_year(text)
         tasks: list[Any] = []
         # Film + série en parallèle : /search/multi ignore trop souvent les films
         # et, en cas d'échec silencieux, Spotify se retrouvait en tête.
-        if media_type == "all":
-            tasks.append(self.tmdb.search(query, "movie", 8))
-            tasks.append(self.tmdb.search(query, "tv", 6))
-        elif media_type in ("movie", "tv"):
-            tasks.append(self.tmdb.search(query, media_type, 8))
-        if media_type in ("all", "game"):
+        want_tmdb = source in (None, "tmdb") and (effective in (None, "movie", "tv"))
+        if want_tmdb:
+            if effective in ("movie", "tv"):
+                tasks.append(self.tmdb.search(text, effective, 8))
+            else:
+                tasks.append(self.tmdb.search(text, "movie", 8))
+                tasks.append(self.tmdb.search(text, "tv", 6))
+        if source in (None, "steam") and effective in (None, "game"):
             tasks.append(self.steam.search(clean, per))
-        if media_type in ("all", "album"):
+        if source in (None, "spotify") and effective in (None, "album"):
             tasks.append(self.spotify.search(clean, "album", per))
-        if media_type in ("all", "track"):
+        if source in (None, "spotify") and effective in (None, "track"):
             tasks.append(self.spotify.search(clean, "track", 3 if wide else 8))
-        if media_type in ("all", "book"):
+        if source in (None, "openlibrary") and effective in (None, "book"):
             tasks.append(self.books.search(clean, per))
 
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
@@ -641,12 +889,25 @@ class MediaCatalog:
             )
 
         merged.sort(key=rank, reverse=True)
-        if wide and not any(hit.source == "tmdb" for hit in merged):
+        if source is None and wide and not any(hit.source == "tmdb" for hit in merged):
             if not self.tmdb.available:
                 logger.warning("Recherche « tous types » sans TMDB : clé absente")
             else:
                 logger.warning("Recherche « tous types » : TMDB n'a rien renvoyé pour %r", query)
         return merged[:25]
+
+    async def _lookup(self, spec: SearchSpec, effective: str | None) -> list[MediaHit]:
+        if spec.source == "tmdb":
+            if spec.lookup_kind == "imdb":
+                return await self.tmdb.find_imdb(spec.lookup_id or "")
+            kind = spec.lookup_kind if spec.lookup_kind in ("movie", "tv") else effective
+            return await self.tmdb.lookup(spec.lookup_id or "", kind if kind in ("movie", "tv") else None)
+        if spec.source == "steam":
+            return await self.steam.lookup(spec.lookup_id or "")
+        if spec.source == "spotify":
+            kind = spec.lookup_kind if spec.lookup_kind in ("album", "track") else effective
+            return await self.spotify.lookup(spec.lookup_id or "", kind if kind in ("album", "track") else None)
+        return []
 
     async def enrich(self, hit: MediaHit) -> MediaHit:
         if hit.source == "tmdb":
