@@ -453,13 +453,13 @@ def append_fiche_sections(
         if seen:
             mine += f"\n{seen}"
         head.append(mine)
+    if social_line:
+        head.append(f"-# {social_line}")
     price = _price_line(hit)
     if price:
         head.append(price)
 
     tail: list[str] = []
-    if social_line:
-        tail.append(f"-# {social_line}")
     overview = pretty.shorten_text(hit.overview, 380) if hit.overview else ""
     if overview:
         tail.append(overview)
