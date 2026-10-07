@@ -189,7 +189,7 @@ class Profil(commands.Cog):
     async def pdp(self, interaction: discord.Interaction, user: discord.Member | None = None) -> None:
         """Génère une carte PDP. Sans membre : menu de sélection multiple."""
         if user is not None:
-            await interaction.response.defer()
+            await interaction.response.defer(ephemeral=True)
             return await self.send_cards(interaction, [user])
 
         view = MemberSelectView(self, interaction.user)
